@@ -2,13 +2,12 @@ import { useGraphModalContext } from '@/components/provider/graph-modal-provider
 import { useGraphContext } from '@/components/provider/graph-provider';
 import { useGraphStateContext } from '@/components/provider/graph-state-provider';
 import { cn } from '@/lib/utils/ui';
-import { ChevronRight, Circle, Diamond, Expand, Minimize2, Triangle } from 'lucide-react';
+import { ChevronRight, Circle, Diamond, Expand, Minimize2, Triangle, Zap, ZapOff } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { Virtuoso } from 'react-virtuoso';
 import { CLTGraphNode } from './graph-types';
 import GraphFeatureLink from './np-feature-link';
 import {
-  clientCheckClaudeMode,
   clientCheckIsEmbed,
   featureTypeToText,
   graphModelHasNpDashboards,
@@ -51,7 +50,7 @@ function FeatureList({
       }
 
       if (
-        clientCheckClaudeMode() &&
+        !visState.showErrorNodes &&
         (node.feature_type === 'mlp reconstruction error' || node.feature_type === 'lorsa error')
       ) {
         return false;
@@ -89,7 +88,7 @@ function FeatureList({
           <svg width={10} height={14} className="mr-0 inline-block">
             <g>
               <g
-                className={`default-icon block fill-none ${node.feature_type === 'mlp reconstruction error' || node.feature_type === 'lorsa error' ? 'opacity-35' : ''} ${(node[linkProp]?.pctInput ?? 0) > 0.25 || (node[linkProp]?.pctInput ?? 0) < -0.25 ? 'stroke-white' : 'stroke-slate-800'} ${node.nodeId && visState.pinnedIds?.includes(node.nodeId) ? 'stroke-[1.7]' : 'stroke-[0.7]'}`}
+                className={`default-icon block ${node.feature_type === 'mlp reconstruction error' ? 'fill-orange-400 stroke-orange-600' : 'fill-none'} ${node.feature_type === 'mlp reconstruction error' ? 'opacity-60' : node.feature_type === 'lorsa error' ? 'opacity-50' : ''} ${(node[linkProp]?.pctInput ?? 0) > 0.25 || (node[linkProp]?.pctInput ?? 0) < -0.25 ? 'stroke-white' : node.feature_type === 'mlp reconstruction error' ? '' : 'stroke-slate-800'} ${node.nodeId && visState.pinnedIds?.includes(node.nodeId) ? 'stroke-[1.7]' : 'stroke-[0.7]'}`}
               >
                 <text fontSize={15} textAnchor="middle" dominantBaseline="central" dx={5} dy={5}>
                   {featureTypeToText(node.feature_type)}
@@ -300,10 +299,17 @@ export default function GraphNodeConnections() {
   const {
     visState,
     selectedGraph,
+    selectedModelId,
     togglePin,
     isEditingLabel,
     getNodeSupernodeAndOverrideLabel,
     setFullNPFeatureDetail,
+    ablatedNodeIds,
+    toggleAblation,
+    ablationResult,
+    ablationError,
+    isAblating,
+    runAblation,
   } = useGraphContext();
 
   const { registerHoverCallback, updateHoverState, clearHoverState, registerClickedCallback, updateClickedState } =
@@ -445,6 +451,32 @@ export default function GraphNodeConnections() {
               )}
               <div className="flex-1 leading-tight">{getNodeSupernodeAndOverrideLabel(clickedNode)}</div>
               <GraphFeatureLink selectedGraph={selectedGraph} node={clickedNode} />
+              {clickedNode.nodeId &&
+                clickedNode.feature_type === 'cross layer transcoder' &&
+                ['gemma-2-2b', 'qwen3-4b'].includes(selectedModelId) && (
+                  <button
+                    type="button"
+                    onClick={() => clickedNode.nodeId && toggleAblation(clickedNode.nodeId)}
+                    className={`flex h-[20px] items-center gap-x-0.5 rounded-full px-1.5 py-0.5 text-[9px] font-medium transition-colors ${
+                      ablatedNodeIds.has(clickedNode.nodeId)
+                        ? 'bg-red-100 text-red-700 hover:bg-red-200'
+                        : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                    }`}
+                    title={ablatedNodeIds.has(clickedNode.nodeId) ? 'Restore this feature' : 'Ablate (zero out) this feature'}
+                  >
+                    {ablatedNodeIds.has(clickedNode.nodeId) ? (
+                      <>
+                        <ZapOff className="h-2.5 w-2.5" />
+                        <span>Ablated</span>
+                      </>
+                    ) : (
+                      <>
+                        <Zap className="h-2.5 w-2.5" />
+                        <span>Ablate</span>
+                      </>
+                    )}
+                  </button>
+                )}
               {!clientCheckIsEmbed() && (
                 <div className="flex flex-col gap-y-0.5">
                   <button
@@ -510,6 +542,86 @@ export default function GraphNodeConnections() {
                   </button>
                 </div>
               )}
+            </div>
+          )}
+          {/* Ablation bar — shown when any features are ablated */}
+          {ablatedNodeIds.size > 0 && (
+            <div className="mt-1.5 flex flex-col gap-y-1 rounded border border-red-200 bg-red-50 px-2 py-1.5">
+              <div className="flex items-center justify-between">
+                <span className="text-[9px] font-medium text-red-700">
+                  {ablatedNodeIds.size} feature{ablatedNodeIds.size > 1 ? 's' : ''} ablated
+                </span>
+                <div className="flex items-center gap-x-1">
+                  <button
+                    type="button"
+                    onClick={runAblation}
+                    disabled={isAblating}
+                    className="rounded bg-red-600 px-1.5 py-0.5 text-[9px] font-medium text-white transition-colors hover:bg-red-700 disabled:opacity-50"
+                  >
+                    {isAblating ? 'Running...' : 'Run'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      ablatedNodeIds.forEach((id) => toggleAblation(id));
+                    }}
+                    className="rounded bg-slate-200 px-1.5 py-0.5 text-[9px] font-medium text-slate-600 transition-colors hover:bg-slate-300"
+                  >
+                    Clear
+                  </button>
+                </div>
+              </div>
+              {ablationError && (
+                <div className="border-t border-red-200 pt-1 text-[9px] text-red-600">
+                  Error: {ablationError}
+                </div>
+              )}
+              {ablationResult && (() => {
+                const stripBos = (s: string) => s.replace(/<bos>/g, '').trim();
+                const firstWithLogits = (logits: typeof ablationResult.defaultLogits) =>
+                  logits.find((l) => l.top_logits && l.top_logits.length > 0);
+                const defaultFirst = firstWithLogits(ablationResult.defaultLogits);
+                const steeredFirst = firstWithLogits(ablationResult.steeredLogits);
+                return (
+                  <div className="flex flex-col gap-y-1 border-t border-red-200 pt-1">
+                    <div className="flex flex-col gap-y-0.5">
+                      <span className="text-[8px] font-semibold uppercase text-slate-500">Default</span>
+                      <span className="font-mono text-[9px] leading-tight text-slate-700">
+                        {stripBos(ablationResult.defaultGeneration)}
+                      </span>
+                    </div>
+                    <div className="flex flex-col gap-y-0.5">
+                      <span className="text-[8px] font-semibold uppercase text-red-500">Ablated</span>
+                      <span className="font-mono text-[9px] leading-tight text-red-700">
+                        {stripBos(ablationResult.steeredGeneration)}
+                      </span>
+                    </div>
+                    {defaultFirst && steeredFirst && (
+                      <div className="flex flex-col gap-y-0.5 border-t border-red-200 pt-1">
+                        <span className="text-[8px] font-semibold uppercase text-slate-500">
+                          Next token after &ldquo;{defaultFirst.token.trim()}&rdquo;
+                        </span>
+                        <div className="text-[9px]">
+                          <span className="text-slate-500">Default: </span>
+                          <span className="font-mono text-slate-700">
+                            {defaultFirst.top_logits.slice(0, 3).map((l) =>
+                              `${l.token.trim()} (${(l.prob * 100).toFixed(1)}%)`
+                            ).join(', ')}
+                          </span>
+                        </div>
+                        <div className="text-[9px]">
+                          <span className="text-red-500">Ablated: </span>
+                          <span className="font-mono text-red-700">
+                            {steeredFirst.top_logits.slice(0, 3).map((l) =>
+                              `${l.token.trim()} (${(l.prob * 100).toFixed(1)}%)`
+                            ).join(', ')}
+                          </span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
             </div>
           )}
           {clickedNode && (

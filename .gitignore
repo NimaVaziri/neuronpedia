@@ -141,4 +141,4 @@ dist
 
 .secrets*
 
-CLAUDE.local.md
+apps/webapp/public/graph-data/

@@ -1,0 +1,241 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://neuronpedia.org/schemas/graph-eval/verified-circuits.schema.json",
+  "title": "Graph Eval Verified Circuits",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "circuits"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "circuits": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/circuit"
+      }
+    }
+  },
+  "$defs": {
+    "circuit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "order",
+        "label",
+        "model_id",
+        "source",
+        "prompt",
+        "target_token",
+        "graph",
+        "circuit",
+        "view",
+        "metadata"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "order": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "url"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "researcher_verified"
+              ]
+            },
+            "url": {
+              "type": "string",
+              "format": "uri"
+            }
+          }
+        },
+        "prompt": {
+          "type": "string",
+          "minLength": 1
+        },
+        "target_token": {
+          "type": "string",
+          "minLength": 1
+        },
+        "graph": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "slug"
+          ],
+          "properties": {
+            "slug": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "circuit": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "pinned_ids",
+            "clicked_id",
+            "supernodes",
+            "clerps"
+          ],
+          "properties": {
+            "pinned_ids": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "clicked_id": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "minLength": 1
+            },
+            "supernodes": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/supernode"
+              }
+            },
+            "clerps": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/clerp"
+              }
+            }
+          }
+        },
+        "view": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "pruning_threshold",
+            "density_threshold"
+          ],
+          "properties": {
+            "pruning_threshold": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0,
+              "maximum": 1
+            },
+            "density_threshold": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0,
+              "maximum": 1
+            }
+          }
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "verified_by",
+            "verified_at",
+            "notes"
+          ],
+          "properties": {
+            "verified_by": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "verified_at": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date"
+            },
+            "notes": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "supernode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "label",
+        "member_ids"
+      ],
+      "properties": {
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "member_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "clerp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "node_id",
+        "label"
+      ],
+      "properties": {
+        "node_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

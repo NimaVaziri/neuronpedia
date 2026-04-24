@@ -6,7 +6,6 @@ import d3 from './d3-jetpack';
 import GraphControls, { MIN_TOKENS_TO_ALLOW_HORIZONTAL_SCROLL } from './graph-controls';
 import { CLTGraphLink, CLTGraphNode } from './graph-types';
 import {
-  clientCheckClaudeMode,
   CLTGraphExtended,
   featureTypeToText,
   featureTypeToTextSize,
@@ -118,8 +117,16 @@ export default function LinkGraph() {
   const [allowScroll, setAllowScroll] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
   const canvasRefs = useRef<Array<HTMLCanvasElement | null>>([null, null, null, null, null]);
-  const { visState, selectedGraph, updateVisStateField, togglePin, isEditingLabel, makeTooltipText } =
-    useGraphContext();
+  const {
+    visState,
+    selectedGraph,
+    updateVisStateField,
+    togglePin,
+    isEditingLabel,
+    makeTooltipText,
+    subgraphScores,
+    ablatedNodeIds,
+  } = useGraphContext();
   const {
     hoveredIdRef,
     updateHoverState,
@@ -131,6 +138,10 @@ export default function LinkGraph() {
     registerClickedCallback,
   } = useGraphStateContext();
   const isEditingLabelRef = useRef(isEditingLabel);
+  const makeTooltipTextRef = useRef(makeTooltipText);
+  makeTooltipTextRef.current = makeTooltipText;
+  const sufficiencyAddedRef = useRef(new Set<string>());
+  sufficiencyAddedRef.current = new Set(visState.sufficiencyAddedIds || []);
   const cRef = useRef<GraphConfig | null>(null);
 
   function colorNodes() {
@@ -603,11 +614,29 @@ export default function LinkGraph() {
       // Update clicked node styling
       nodeSel
         .classed('clicked', (d: any) => Boolean(d.nodeId === clickedId))
-        .attr('fill', (d: any) =>
-          d.tmpClickedLink ? d.tmpClickedLink.pctInputColor || d.nodeColor || '#000' : d.nodeColor || '#000',
-        )
-        .attr('stroke', (d: any) => (d.nodeId === clickedId ? '#f0f' : '#000'))
-        .attr('stroke-width', (d: any) => (d.nodeId === clickedId ? 1.5 : 0.5));
+        .attr('opacity', (d: any) => {
+          if (d.nodeId && ablatedNodeIds.has(d.nodeId)) return 0.3;
+          if (d.feature_type === 'mlp reconstruction error') return visState.showErrorNodes ? 0.5 : 1;
+          return 1;
+        })
+        .attr('fill', (d: any) => {
+          if (d.nodeId && ablatedNodeIds.has(d.nodeId)) return '#94a3b8';
+          if (d.nodeId && sufficiencyAddedRef.current.has(d.nodeId)) return '#86efac';
+          if (d.feature_type === 'mlp reconstruction error') return visState.showErrorNodes ? '#fdba74' : '#f1f5f9';
+          return d.tmpClickedLink ? d.tmpClickedLink.pctInputColor || d.nodeColor || '#000' : d.nodeColor || '#000';
+        })
+        .attr('stroke', (d: any) => {
+          if (d.nodeId === clickedId) return '#f0f';
+          if (d.nodeId && ablatedNodeIds.has(d.nodeId)) return '#94a3b8';
+          if (d.nodeId && sufficiencyAddedRef.current.has(d.nodeId)) return '#16a34a';
+          if (d.feature_type === 'mlp reconstruction error') return visState.showErrorNodes ? '#ea580c' : '#e2e8f0';
+          return '#000';
+        })
+        .attr('stroke-width', (d: any) => {
+          if (d.nodeId === clickedId) return 1.5;
+          if (d.nodeId && sufficiencyAddedRef.current.has(d.nodeId)) return 2;
+          return 0.5;
+        });
 
       // Clear previous clicked links
       const svgBBox = svgRef.current.getBoundingClientRect();
@@ -648,7 +677,7 @@ export default function LinkGraph() {
         drawLinks(clickedLinks, clickedCtx, 0.05);
       }
     },
-    [selectedGraph, visState],
+    [selectedGraph, visState, ablatedNodeIds],
   );
 
   // Combined clicked update function
@@ -711,9 +740,18 @@ export default function LinkGraph() {
 
     const data = selectedGraph as CLTGraphExtended;
     let nodes = filterNodes(data, data.nodes, selectedGraph, visState, clickedIdRef.current);
-    if (clientCheckClaudeMode()) {
-      nodes = nodes.filter((d) => d.feature_type !== 'mlp reconstruction error' && d.feature_type !== 'lorsa error');
-    }
+
+    // In Claude mode, filter out error nodes — but keep high-influence ones when
+    // the user has pinned nodes and completeness is below threshold, to guide discovery
+    const highlightedErrorNodeIds = new Set(
+      visState.pinnedIds.length > 0 && subgraphScores.completenessScore < 0.8
+        ? subgraphScores.errorNodeInfluences.slice(0, 3).map((e) => e.nodeId)
+        : [],
+    );
+    // Note: error nodes are always included in the graph — showErrorNodes controls their color/opacity
+
+    // Sufficiency-added features get a distinct green style
+    const sufficiencyAddedSet = new Set(visState.sufficiencyAddedIds || []);
 
     // Set up the base SVG container
     const svgContainer = d3.select(svgRef.current);
@@ -985,14 +1023,39 @@ export default function LinkGraph() {
         return `translate(${pos[0]},${pos[1]})`;
       })
       .text((d) => featureTypeToText(d.feature_type))
-      .attr('opacity', (d) =>
-        d.feature_type === 'mlp reconstruction error' || d.feature_type === 'lorsa error' ? 0.35 : 1,
-      )
+      .attr('opacity', (d) => {
+        if (d.nodeId && ablatedNodeIds.has(d.nodeId)) return 0.3;
+        if (d.feature_type === 'mlp reconstruction error') {
+          if (!visState.showErrorNodes) return 1;
+          return 0.5;
+        }
+        if (d.feature_type === 'lorsa error') {
+          return visState.showErrorNodes ? 0.5 : 1;
+        }
+        return 1;
+      })
       .attr('font-family', 'Arial')
       .attr('font-size', (d) => featureTypeToTextSize(isMobile, d.feature_type)) // weird safari mobile bug where it renders the diamond too large
-      .attr('fill', (d) => d.nodeColor || '#000')
-      .attr('stroke', '#000')
-      .attr('stroke-width', 2)
+      .attr('fill', (d) => {
+        if (d.nodeId && ablatedNodeIds.has(d.nodeId)) return '#94a3b8';
+        if (d.nodeId && sufficiencyAddedSet.has(d.nodeId)) return '#86efac'; // green-300
+        if (d.feature_type === 'mlp reconstruction error') {
+          if (!visState.showErrorNodes) return '#ffffff';
+          return '#fdba74';
+        }
+        if (d.feature_type === 'lorsa error' && !visState.showErrorNodes) return '#ffffff';
+        return d.nodeColor || '#000';
+      })
+      .attr('stroke', (d) => {
+        if (d.nodeId && ablatedNodeIds.has(d.nodeId)) return '#94a3b8';
+        if (d.nodeId && sufficiencyAddedSet.has(d.nodeId)) return '#16a34a'; // green-600
+        if (d.feature_type === 'mlp reconstruction error') return visState.showErrorNodes ? '#ea580c' : '#e2e8f0';
+        return '#000';
+      })
+      .attr('stroke-width', (d) => {
+        if (d.nodeId && sufficiencyAddedSet.has(d.nodeId)) return 3;
+        return 2;
+      })
       .attr('text-anchor', 'middle')
       .attr('dominant-baseline', 'central');
 
@@ -1035,11 +1098,35 @@ export default function LinkGraph() {
 
     // Style nodes based on their tmp clicked link
     nodeSel
-      .attr('fill', (d) =>
-        d.tmpClickedLink ? d.tmpClickedLink.pctInputColor || d.nodeColor || '#000' : d.nodeColor || '#000',
-      )
-      .attr('stroke', (d) => (d.nodeId === clickedIdRef.current ? '#f0f' : '#000'))
-      .attr('stroke-width', (d) => (d.nodeId === clickedIdRef.current ? 1.5 : 0.5));
+      .attr('opacity', (d) => {
+        if (d.nodeId && ablatedNodeIds.has(d.nodeId)) return 0.3;
+        if (d.feature_type === 'mlp reconstruction error') {
+          if (!visState.showErrorNodes) return 1;
+          return 0.5;
+        }
+        return 1;
+      })
+      .attr('fill', (d) => {
+        if (d.nodeId && ablatedNodeIds.has(d.nodeId)) return '#94a3b8';
+        if (d.nodeId && sufficiencyAddedSet.has(d.nodeId)) return '#86efac';
+        if (d.feature_type === 'mlp reconstruction error') {
+          if (!visState.showErrorNodes) return '#ffffff';
+          return '#fdba74';
+        }
+        return d.tmpClickedLink ? d.tmpClickedLink.pctInputColor || d.nodeColor || '#000' : d.nodeColor || '#000';
+      })
+      .attr('stroke', (d) => {
+        if (d.nodeId === clickedIdRef.current) return '#f0f';
+        if (d.nodeId && ablatedNodeIds.has(d.nodeId)) return '#94a3b8';
+        if (d.nodeId && sufficiencyAddedSet.has(d.nodeId)) return '#16a34a';
+        if (d.feature_type === 'mlp reconstruction error') return visState.showErrorNodes ? '#ea580c' : '#e2e8f0';
+        return '#000';
+      })
+      .attr('stroke-width', (d) => {
+        if (d.nodeId === clickedIdRef.current) return 1.5;
+        if (d.nodeId && sufficiencyAddedSet.has(d.nodeId)) return 2;
+        return 0.5;
+      });
 
     // Add mouse event handlers for graph interaction
     const maxHoverDistance = 30;
@@ -1081,7 +1168,7 @@ export default function LinkGraph() {
           // Hover behavior
           // console.log('Setting hover state:', currentHoveredFeatureId);
           updateHoverState(closestNode, onHoverChange);
-          showTooltip(event, closestNode, makeTooltipText(closestNode));
+          showTooltip(event, closestNode, makeTooltipTextRef.current(closestNode));
           // NOTE: Hover circle display is now handled by the callback
         }
       })
@@ -1223,6 +1310,9 @@ export default function LinkGraph() {
     visState.linkType,
     visState.pinnedIds,
     visState.subgraph,
+    visState.showErrorNodes,
+    visState.sufficiencyAddedIds,
+    ablatedNodeIds,
     allowScroll,
     isExpanded,
   ]);

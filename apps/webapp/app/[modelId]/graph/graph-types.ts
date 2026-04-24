@@ -23,6 +23,27 @@ export type CltSubgraphState = {
 };
 // https://github.com/anthropics/attribution-graphs-frontend/blob/main/attribution_graph/init-cg.js
 
+export type ErrorNodeInfluence = {
+  nodeId: string;
+  influence: number;
+  layer: string;
+  ctxIdx: number;
+};
+
+export type ErrorEdgeAnalysis = {
+  leakingPins: Array<{ pinnedNodeId: string; errorNodeId: string; weight: number }>;
+  unexplainedPins: Array<{ pinnedNodeId: string; errorNodeId: string; weight: number }>;
+  bridgeCandidates: Array<{ nodeId: string; score: number }>;
+};
+
+export type GraphScores = {
+  replacementScore: number;
+  completenessScore: number;
+  errorNodeInfluences: ErrorNodeInfluence[];
+  suggestedPinIds: string[];
+  errorEdgeAnalysis: ErrorEdgeAnalysis;
+};
+
 export type CltVisState = {
   pinnedIds: string[];
   hiddenIds: string[];
@@ -45,6 +66,12 @@ export type CltVisState = {
   clerps: string[][];
 
   pruningThreshold?: number;
+
+  // whether to show error nodes in the graph (default true)
+  showErrorNodes: boolean;
+
+  // IDs of features added by sufficiency refinement (rendered differently in graph)
+  sufficiencyAddedIds?: string[];
 
   // only for neuronpedia dashboards
   densityThreshold?: number;

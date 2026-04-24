@@ -1,9 +1,10 @@
 import { CLTGraph } from './graph-types';
+import type { WorkerScoreResult } from './score.worker';
 
 export async function computeGraphScoresInWorker(
   graph: CLTGraph,
   pinnedIds: string[] = [],
-): Promise<{ replacementScore: number; completenessScore: number }> {
+): Promise<WorkerScoreResult> {
   const { nodes, links } = graph;
 
   // Check if Worker is available
@@ -66,6 +67,9 @@ export async function computeGraphScoresInWorker(
       resolve({
         replacementScore: data.replacementScore || 0,
         completenessScore: data.completenessScore || 0,
+        errorNodeInfluences: data.errorNodeInfluences || [],
+        suggestedPinIds: data.suggestedPinIds || [],
+        errorEdgeAnalysis: data.errorEdgeAnalysis || { leakingPins: [], unexplainedPins: [], bridgeCandidates: [] },
       });
     }
     function handleError(err: ErrorEvent) {

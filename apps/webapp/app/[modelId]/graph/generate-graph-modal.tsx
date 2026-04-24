@@ -628,7 +628,10 @@ export default function GenerateGraphModal({ showGenerateModal }: { showGenerate
                                 setFieldValue('edgeThreshold', getEdgeThresholdDefault(value));
                                 setFieldValue('maxFeatureNodes', getMaxFeatureNodesDefault(value));
                                 setTimeout(() => {
-                                  setFieldValue('sourceSetName', getHasGraphsSourceSetsForModelId(value)[0].name);
+                                  const sourceSets = getHasGraphsSourceSetsForModelId(value);
+                                  if (sourceSets.length > 0) {
+                                    setFieldValue('sourceSetName', sourceSets[0].name);
+                                  }
                                 }, 100);
                                 setGraphTokenizeResponse(null);
                                 setChatPrompts([]);

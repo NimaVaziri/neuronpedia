@@ -26,7 +26,7 @@ import {
 } from 'lucide-react';
 import { useSession } from 'next-auth/react';
 import { useSearchParams } from 'next/navigation';
-import { Fragment, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 import GraphInfoModal from './graph-info-modal';
 import { FilterGraphType } from './graph-types';
 import UploadGraphModal from './upload-graph-modal';
@@ -38,6 +38,7 @@ export default function GraphToolbar() {
   const { setSignInModalOpen } = useGlobalContext();
   const router = useRouter();
   const [isDeleting, setIsDeleting] = useState(false);
+  const [showGuideBadge, setShowGuideBadge] = useState(false);
   const {
     modelIdToMetadataMap,
     selectedModelId,
@@ -51,6 +52,14 @@ export default function GraphToolbar() {
   } = useGraphContext();
   const { setIsWelcomeModalOpen, setIsCopyModalOpen, setIsGenerateGraphModalOpen } = useGraphModalContext();
   const { globalModels, getSourceSet, getHasGraphsSourceSetsForModelId } = useGlobalContext();
+
+  useEffect(() => {
+    try {
+      setShowGuideBadge(!localStorage.getItem('circuit-tracer-visited'));
+    } catch {
+      setShowGuideBadge(false);
+    }
+  }, []);
 
   if (isEmbed) {
     return (
@@ -122,17 +131,7 @@ export default function GraphToolbar() {
           onClick={() => setIsWelcomeModalOpen(true)}
         >
           <BookOpenIcon className="mr-1.5 h-4 w-4" /> Guide
-          {(() => {
-            try {
-              const hasVisited = localStorage.getItem('circuit-tracer-visited');
-              if (!hasVisited) {
-                return <div className="absolute -right-1 -top-1 h-3 w-3 rounded-full bg-red-500" />;
-              }
-            } catch (error) {
-              // Silently handle localStorage errors
-            }
-            return null;
-          })()}
+          {showGuideBadge && <div className="absolute -right-1 -top-1 h-3 w-3 rounded-full bg-red-500" />}
         </Button>
 
         <Button

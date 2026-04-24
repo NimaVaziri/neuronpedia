@@ -1,0 +1,131 @@
+{
+  "description": "Small deterministic graph for CircuitExplorer scorer review. Expected scores pin increasingly complete feature sets against one target logit.",
+  "nodes": [
+    {
+      "node_id": "embed_0",
+      "feature_type": "embedding",
+      "layer": "E",
+      "ctx_idx": 0,
+      "feature": 0,
+      "token_prob": 0.0,
+      "influence": 0.0,
+      "clerp": "Dallas"
+    },
+    {
+      "node_id": "0_10",
+      "feature_type": "cross layer transcoder",
+      "layer": "0",
+      "ctx_idx": 0,
+      "feature": 10,
+      "token_prob": 0.0,
+      "influence": 0.8,
+      "clerp": ""
+    },
+    {
+      "node_id": "0_11",
+      "feature_type": "cross layer transcoder",
+      "layer": "0",
+      "ctx_idx": 0,
+      "feature": 11,
+      "token_prob": 0.0,
+      "influence": 0.4,
+      "clerp": ""
+    },
+    {
+      "node_id": "err_0",
+      "feature_type": "mlp reconstruction error",
+      "layer": "0",
+      "ctx_idx": 0,
+      "feature": 0,
+      "token_prob": 0.0,
+      "influence": 0.0,
+      "clerp": ""
+    },
+    {
+      "node_id": "logit_target",
+      "feature_type": "logit",
+      "layer": "0",
+      "ctx_idx": 0,
+      "feature": 0,
+      "token_prob": 0.7,
+      "influence": 0.0,
+      "clerp": " Austin"
+    },
+    {
+      "node_id": "logit_other",
+      "feature_type": "logit",
+      "layer": "0",
+      "ctx_idx": 0,
+      "feature": 0,
+      "token_prob": 0.0,
+      "influence": 0.0,
+      "clerp": " Houston"
+    }
+  ],
+  "links": [
+    {
+      "source": "embed_0",
+      "target": "0_10",
+      "weight": 0.5
+    },
+    {
+      "source": "embed_0",
+      "target": "0_11",
+      "weight": 0.2
+    },
+    {
+      "source": "0_10",
+      "target": "logit_target",
+      "weight": 0.8
+    },
+    {
+      "source": "0_11",
+      "target": "logit_target",
+      "weight": 0.3
+    },
+    {
+      "source": "0_11",
+      "target": "err_0",
+      "weight": 0.4
+    },
+    {
+      "source": "err_0",
+      "target": "logit_other",
+      "weight": 0.1
+    }
+  ],
+  "expected_scores": [
+    {
+      "pinned_ids": [],
+      "replacementScore": 0.0,
+      "completenessScore": 0.0
+    },
+    {
+      "pinned_ids": ["0_10"],
+      "replacementScore": 0.013093290850520134,
+      "completenessScore": 0.03809524327516556
+    },
+    {
+      "pinned_ids": ["0_11"],
+      "replacementScore": 0.5789473652839661,
+      "completenessScore": 0.8048780560493469
+    },
+    {
+      "pinned_ids": ["0_10", "0_11"],
+      "replacementScore": 1.0,
+      "completenessScore": 1.0
+    }
+  ],
+  "expected_ia_pc": {
+    "endpoint_ids": ["embed_0", "logit_target"],
+    "max_steps": 5,
+    "pc_passes": 1,
+    "pc_candidates": 5,
+    "pinnedIds": ["embed_0", "logit_target", "0_10", "0_11"],
+    "iaFeatures": 2,
+    "pcFeatures": 0,
+    "totalFeatures": 2,
+    "replacementScore": 1.0,
+    "completenessScore": 1.0
+  }
+}

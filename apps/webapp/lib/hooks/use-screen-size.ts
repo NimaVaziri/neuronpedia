@@ -3,21 +3,20 @@
 import { useEffect, useState } from 'react';
 
 export const useScreenSize = () => {
-  const windowIsUndefined = typeof window === 'undefined';
-
   const [screenSize, setScreenSize] = useState({
-    width: windowIsUndefined ? 0 : window.innerWidth,
-    height: windowIsUndefined ? 0 : window.innerHeight,
+    width: 0,
+    height: 0,
   });
 
   useEffect(() => {
     const handleResize = () => {
       setScreenSize({
-        width: windowIsUndefined ? 0 : window.innerWidth,
-        height: windowIsUndefined ? 0 : window.innerHeight,
+        width: window.innerWidth,
+        height: window.innerHeight,
       });
     };
 
+    handleResize();
     window.addEventListener('resize', handleResize);
 
     // Clean up the event listener when the component unmounts

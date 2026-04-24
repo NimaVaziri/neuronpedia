@@ -10,7 +10,7 @@ export default defineConfig({
   test: {
     // https://github.com/vitest-dev/vitest/issues/990
     globals: true,
-    include: ['components/**/*.test.tsx', 'lib/**/*.test.ts'],
+    include: ['components/**/*.test.tsx', 'lib/**/*.test.ts', 'app/**/features/circuit-explorer/**/*.test.{ts,tsx}'],
     environment: 'jsdom',
     setupFiles: ['./vitest.setup.ts'],
     server: {
@@ -25,7 +25,7 @@ export default defineConfig({
     },
     coverage: {
       provider: 'v8',
-      include: ['components/**/*.{ts,tsx}', 'lib/**/*.ts'],
+      include: ['components/**/*.{ts,tsx}', 'lib/**/*.ts', 'app/**/features/circuit-explorer/**/*.{ts,tsx}'],
       exclude: ['**/*.test.{ts,tsx}', '**/__tests__/**'],
     },
   },

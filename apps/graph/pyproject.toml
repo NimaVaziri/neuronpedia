@@ -18,6 +18,7 @@ circuit-tracer = { git = "https://github.com/safety-research/circuit-tracer.git"
 llamascopium = { git = "https://github.com/OpenMOSS/Language-Model-SAEs.git", tag = "v2.0.0b34", optional = true }
 python-dotenv = "^1.1.0"
 hf-transfer = "^0.1.9"
+anthropic = "^0.95.0"
 
 [tool.poetry.extras]
 crm = ["llamascopium"]

@@ -1,9 +1,9 @@
 import gc
 import gzip
-import json
 import os
 import threading
 import time
+from collections import OrderedDict
 from importlib.metadata import version as pkg_version
 from typing import Any
 
@@ -14,6 +14,9 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
+from neuronpedia_graph.explorer import ExploreCircuitsJob, build_explore_circuits_response
+from neuronpedia_graph.grouping import auto_group_nodes, format_grouping_response
+from neuronpedia_graph.scorer import BatchGraphScorer
 from pydantic import BaseModel, ValidationError
 from starlette.concurrency import run_in_threadpool
 from transformers import AutoTokenizer
@@ -42,6 +45,9 @@ elif BACKEND == "lm-saes-crm":
 
 LIMIT_TOKENS = int(os.getenv("TOKEN_LIMIT", 64))
 DEFAULT_MAX_FEATURE_NODES = int(os.getenv("MAX_FEATURE_NODES", 10000))
+MAX_SCORER_CACHE_ITEMS = int(os.getenv("MAX_SCORER_CACHE_ITEMS", 8))
+MAX_GRAPH_CACHE_ITEMS = int(os.getenv("MAX_GRAPH_CACHE_ITEMS", 8))
+PREBUILD_SCORER_ON_GENERATE = os.getenv("PREBUILD_SCORER_ON_GENERATE", "").lower() == "true"
 OFFLOAD = None
 UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", 1000))
 
@@ -89,11 +95,16 @@ def get_model_dtype() -> torch.dtype | None:
 
 
 app = FastAPI()
-app.add_middleware(GZipMiddleware, minimum_size=1000)
+from starlette.middleware.cors import CORSMiddleware
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+# GZipMiddleware disabled — it buffers StreamingResponse bodies, breaking SSE
+# app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 transcoders: Any = None
 model: Any = None
 request_lock = threading.Lock()
+_tokenizer: Any = None
+_tokenizer_lock = threading.Lock()
 
 TRANSCODER_SET_TO_SOURCE_URL_ARRAYS = {
     "gemma": [
@@ -159,16 +170,54 @@ else:
         return model_id.startswith("google/gemma-3-")
 
     is_nnsight_model = check_is_nnsight_model(loaded_model_arg)
+    lazy_encoder = is_nnsight_model or os.getenv("LAZY_ENCODER", "").lower() == "true"
 
     model = ReplacementModel.from_pretrained(
         loaded_model_arg,
         transcoder_set,
         device=device,
         dtype=model_dtype,
-        lazy_encoder=is_nnsight_model,
+        lazy_encoder=lazy_encoder,
         lazy_decoder=True,
         backend="nnsight" if is_nnsight_model else "transformerlens",
     )
+
+
+def get_shared_tokenizer():
+    global _tokenizer
+    if _tokenizer is None:
+        with _tokenizer_lock:
+            if _tokenizer is None:
+                _tokenizer = AutoTokenizer.from_pretrained(model.cfg.tokenizer_name)
+    return _tokenizer
+
+
+def _prune_lru_cache(cache: "OrderedDict[str, Any]", max_items: int, label: str):
+    while max_items >= 0 and len(cache) > max_items:
+        evicted_slug, evicted_value = cache.popitem(last=False)
+        del evicted_value
+        print(f"Evicted {label} cache entry '{evicted_slug}'")
+
+
+def _cache_graph_artifacts(slug: str, scorer: Any, graph_data: dict[str, Any]):
+    if MAX_SCORER_CACHE_ITEMS > 0:
+        _scorer_cache.pop(slug, None)
+        _scorer_cache[slug] = scorer
+        _prune_lru_cache(_scorer_cache, MAX_SCORER_CACHE_ITEMS, "scorer")
+
+    if MAX_GRAPH_CACHE_ITEMS > 0:
+        _graph_cache.pop(slug, None)
+        _graph_cache[slug] = graph_data
+        _prune_lru_cache(_graph_cache, MAX_GRAPH_CACHE_ITEMS, "graph")
+
+
+def _get_cached_scorer(slug: str):
+    scorer = _scorer_cache.get(slug)
+    if scorer is not None:
+        _scorer_cache.move_to_end(slug)
+        if slug in _graph_cache:
+            _graph_cache.move_to_end(slug)
+    return scorer
 
 
 def printMemory():
@@ -235,6 +284,18 @@ class SteerRequest(BaseModel):
     freeze_attention: bool = False
 
 
+class SteerBatchRequest(BaseModel):
+    model_id: str
+    prompt: str
+    feature_sets: list[list[SteerFeature]]
+    n_tokens: int = 10
+    top_k: int = 5
+    temperature: float = 0.0
+    freq_penalty: float = 0
+    seed: int | None = None
+    freeze_attention: bool = False
+
+
 @app.get("/check-busy")
 async def check_busy():
     """Check if the server is currently busy processing a request."""
@@ -243,11 +304,160 @@ async def check_busy():
 
 
 def get_topk(logits: torch.Tensor, tokenizer, k: int = 5):
-    probs = torch.softmax(logits[0, -1, :], dim=-1)
+    raw_logits = logits[0, -1, :]
+    probs = torch.softmax(raw_logits, dim=-1)
     topk = torch.topk(probs, k)
     return [
-        (tokenizer.decode([topk.indices[i]]), topk.values[i].item()) for i in range(k)
+        (tokenizer.decode([topk.indices[i]]), topk.values[i].item(), raw_logits[topk.indices[i]].item())
+        for i in range(k)
     ]
+
+
+def _validate_steer_features(features: list[SteerFeature], sequence_length: int):
+    for feature in features:
+        if feature.ablate and feature.delta is not None:
+            raise HTTPException(status_code=400, detail="When ablate is True, delta must be None")
+        if not feature.ablate and feature.delta is None:
+            raise HTTPException(status_code=400, detail="When ablate is False, delta must be provided")
+        if feature.steer_generated_tokens and feature.steer_position is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="When steer_generated_tokens is True, position must be None",
+            )
+        if not feature.steer_generated_tokens and feature.steer_position is None:
+            raise HTTPException(
+                status_code=400,
+                detail="When steer_generated_tokens is False, position must be provided",
+            )
+        if feature.steer_position is not None and (
+            feature.steer_position < 0 or feature.steer_position >= sequence_length
+        ):
+            raise HTTPException(status_code=400, detail="Position is out of bounds")
+
+
+def _build_intervention_tuples(
+    features: list[SteerFeature],
+    activations,
+    sequence_length: int,
+):
+    intervention_tuples = []
+    for f in features:
+        if f.steer_generated_tokens:
+            intervention_tuples.append(
+                (
+                    f.layer,
+                    slice(sequence_length, None, None),
+                    f.index,
+                    0 if f.ablate else activations[(f.layer, f.token_active_position, f.index)] + f.delta,
+                )
+            )
+        else:
+            intervention_tuples.append(
+                (
+                    f.layer,
+                    f.steer_position,
+                    f.index,
+                    0 if f.ablate else activations[(f.layer, f.token_active_position, f.index)] + f.delta,
+                )
+            )
+    return intervention_tuples
+
+
+def _compute_default_run(req_data, sequence_length: int):
+    if req_data.seed is not None:
+        torch.manual_seed(req_data.seed)
+    default_tokenized = model.generate(
+        req_data.prompt,
+        do_sample=True,
+        use_past_kv_cache=False,
+        verbose=False,
+        stop_at_eos=True,
+        max_new_tokens=req_data.n_tokens,
+        temperature=req_data.temperature,
+        freq_penalty=req_data.freq_penalty,
+        return_type="tokens",
+    )[0]
+    default_tokenized_str_tokens = [
+        model.tokenizer.decode([token]) for token in default_tokenized
+    ]
+    default_generation = "".join(default_tokenized_str_tokens)
+
+    with torch.inference_mode():
+        default_logits = model(default_tokenized.unsqueeze(0))
+        if default_logits.dim() == 2:
+            default_logits = default_logits.unsqueeze(0)
+        topk_default_by_token = []
+        for i in range(len(default_tokenized_str_tokens)):
+            if i < sequence_length - 1:
+                topk_default_by_token.append(
+                    {"token": default_tokenized_str_tokens[i], "top_logits": []}
+                )
+                continue
+            topk_default = get_topk(
+                default_logits[:, : i + 1, :], model.tokenizer, req_data.top_k
+            )
+            topk_default_by_token.append(
+                {
+                    "token": default_tokenized_str_tokens[i],
+                    "top_logits": [
+                        {"token": token, "prob": prob, "logit": logit}
+                        for token, prob, logit in topk_default
+                    ],
+                }
+            )
+
+    return default_tokenized_str_tokens, default_generation, topk_default_by_token
+
+
+def _compute_steered_run(req_data, sequence_length: int, intervention_tuples, default_tokenized_str_tokens):
+    if req_data.seed is not None:
+        torch.manual_seed(req_data.seed)
+    steered_tokenized, steered_logits, _ = model.feature_intervention_generate(
+        req_data.prompt,
+        intervention_tuples,
+        freeze_attention=req_data.freeze_attention,
+        do_sample=True,
+        verbose=False,
+        stop_at_eos=True,
+        max_new_tokens=req_data.n_tokens + 1,
+        temperature=req_data.temperature,
+        freq_penalty=req_data.freq_penalty,
+        return_type="tokens",
+    )
+    steered_tokenized = steered_tokenized[0]
+    steered_tokenized_str_tokens = [
+        model.tokenizer.decode([token]) for token in steered_tokenized
+    ]
+    steered_generation = "".join(steered_tokenized_str_tokens)
+
+    if steered_logits.dim() == 2:
+        steered_logits = steered_logits.unsqueeze(0)
+
+    topk_steered_by_token = []
+    for i in range(len(default_tokenized_str_tokens)):
+        if i < sequence_length - 1:
+            topk_steered_by_token.append(
+                {"token": steered_tokenized_str_tokens[i], "top_logits": []}
+            )
+            continue
+        gen_idx = i - (sequence_length - 1)
+        topk_steered = get_topk(
+            steered_logits[:, : gen_idx + 1, :], model.tokenizer, req_data.top_k
+        )
+        topk_steered_by_token.append(
+            {
+                "token": steered_tokenized_str_tokens[i],
+                "top_logits": [
+                    {"token": token, "prob": prob, "logit": logit}
+                    for token, prob, logit in topk_steered
+                ],
+            }
+        )
+
+    return {
+        "STEERED_LOGITS_BY_TOKEN": topk_steered_by_token,
+        "STEERED_GENERATION": steered_generation,
+    }
 
 
 @app.post("/steer", dependencies=[Depends(verify_secret_key)])
@@ -277,187 +487,27 @@ async def steer_handler(req: Request):
             )
 
         sequence_length = len(model.tokenizer(req_data.prompt).input_ids)
-
-        # Validate that if ablate is True, delta must be None
-        for feature in req_data.features:
-            if feature.ablate and feature.delta is not None:
-                return JSONResponse(
-                    content={"error": "When ablate is True, delta must be None"},
-                    status_code=400,
-                )
-            if not feature.ablate and feature.delta is None:
-                return JSONResponse(
-                    content={"error": "When ablate is False, delta must be provided"},
-                    status_code=400,
-                )
-            if feature.steer_generated_tokens and feature.steer_position is not None:
-                return JSONResponse(
-                    content={
-                        "error": "When steer_generated_tokens is True, position must be None"
-                    },
-                    status_code=400,
-                )
-            # Validate that if steer_generated_tokens is False, position must be provided
-            if not feature.steer_generated_tokens and feature.steer_position is None:
-                return JSONResponse(
-                    content={
-                        "error": "When steer_generated_tokens is False, position must be provided"
-                    },
-                    status_code=400,
-                )
-            # Validate that if position is provided, it's not out of bounds
-            if feature.steer_position is not None and (
-                feature.steer_position < 0 or feature.steer_position >= sequence_length
-            ):
-                return JSONResponse(
-                    content={"error": "Position is out of bounds"},
-                    status_code=400,
-                )
+        _validate_steer_features(req_data.features, sequence_length)
 
         print(f"Received steer request: {req_data}")
 
         _, activations = model.get_activations(req_data.prompt, sparse=True)
-
-        intervention_tuples = []
-        for f in req_data.features:
-            if f.steer_generated_tokens:
-                intervention_tuples.append(
-                    (
-                        f.layer,
-                        # TODO: double check this
-                        slice(sequence_length, None, None),
-                        f.index,
-                        0
-                        if f.ablate
-                        else activations[(f.layer, f.token_active_position, f.index)]
-                        + f.delta,
-                    )
-                )
-            else:
-                intervention_tuples.append(
-                    (
-                        f.layer,
-                        f.steer_position,
-                        f.index,
-                        0
-                        if f.ablate
-                        else activations[(f.layer, f.token_active_position, f.index)]
-                        + f.delta,
-                    )
-                )
-
-        # set the seed
-        if req_data.seed is not None:
-            torch.manual_seed(req_data.seed)
-        default_tokenized = model.generate(
-            req_data.prompt,
-            do_sample=True,
-            use_past_kv_cache=False,
-            verbose=False,
-            stop_at_eos=True,
-            max_new_tokens=req_data.n_tokens,
-            temperature=req_data.temperature,
-            freq_penalty=req_data.freq_penalty,
-            return_type="tokens",
-        )[0]
-
-        default_tokenized_str_tokens = [
-            model.tokenizer.decode([token]) for token in default_tokenized
-        ]
-
-        default_generation = "".join(default_tokenized_str_tokens)
-
-        # reset the seed
-        if req_data.seed is not None:
-            torch.manual_seed(req_data.seed)
-        (steered_tokenized, steered_logits, _) = model.feature_intervention_generate(
-            req_data.prompt,
-            intervention_tuples,
-            freeze_attention=req_data.freeze_attention,
-            do_sample=True,
-            verbose=False,
-            stop_at_eos=True,
-            max_new_tokens=req_data.n_tokens + 1,
-            temperature=req_data.temperature,
-            freq_penalty=req_data.freq_penalty,
-            return_type="tokens",
+        intervention_tuples = _build_intervention_tuples(req_data.features, activations, sequence_length)
+        default_tokenized_str_tokens, default_generation, topk_default_by_token = _compute_default_run(
+            req_data, sequence_length
+        )
+        steered_result = _compute_steered_run(
+            req_data, sequence_length, intervention_tuples, default_tokenized_str_tokens
         )
 
-        steered_tokenized = steered_tokenized[0]
-        steered_tokenized_str_tokens = [
-            model.tokenizer.decode([token]) for token in steered_tokenized
-        ]
-        steered_generation = "".join(steered_tokenized_str_tokens)
-
-        # Cross-layer transcoders return 2D logits (seq, vocab) — normalize to 3D
-        if steered_logits.dim() == 2:
-            steered_logits = steered_logits.unsqueeze(0)
-
-        # get the logits at each step
-        topk_default_by_token = []
-        topk_steered_by_token = []
-
-        with torch.inference_mode():
-            # Pass token IDs directly to avoid retokenization (which can
-            # prepend a duplicate BOS and shift logit positions by one).
-            default_logits = model(default_tokenized.unsqueeze(0))
-            if default_logits.dim() == 2:
-                default_logits = default_logits.unsqueeze(0)
-
-            # iterate through the tokens and get the logits
-            for i in range(len(default_tokenized_str_tokens)):
-                # If we're still processing the original prompt tokens (before generation),
-                # append a blank item since we're only interested in generated tokens
-                if i < sequence_length - 1:
-                    topk_default_by_token.append(
-                        {"token": default_tokenized_str_tokens[i], "top_logits": []}
-                    )
-                    continue
-                # get the topk tokens
-                topk_default = get_topk(
-                    default_logits[:, : i + 1, :], model.tokenizer, req_data.top_k
-                )
-                # each topk default should be an object of token, prob
-                topk_default_by_token.append(
-                    {
-                        "token": default_tokenized_str_tokens[i],
-                        "top_logits": [
-                            {"token": token, "prob": prob}
-                            for token, prob in topk_default
-                        ],
-                    }
-                )
-            # steered_logits only contains generation-step logits (no prompt positions),
-            # so we offset the index: position 0 in steered_logits = sequence_length - 1
-            # in the full token sequence.
-            for i in range(len(default_tokenized_str_tokens)):
-                if i < sequence_length - 1:
-                    topk_steered_by_token.append(
-                        {"token": steered_tokenized_str_tokens[i], "top_logits": []}
-                    )
-                    continue
-                gen_idx = i - (sequence_length - 1)
-                topk_steered = get_topk(
-                    steered_logits[:, : gen_idx + 1, :], model.tokenizer, req_data.top_k
-                )
-                topk_steered_by_token.append(
-                    {
-                        "token": steered_tokenized_str_tokens[i],
-                        "top_logits": [
-                            {"token": token, "prob": prob}
-                            for token, prob in topk_steered
-                        ],
-                    }
-                )
-
         print(f"Default generation: {default_generation}")
-        print(f"Steered generation: {steered_generation}")
+        print(f"Steered generation: {steered_result['STEERED_GENERATION']}")
 
         response = {
             "DEFAULT_LOGITS_BY_TOKEN": topk_default_by_token,
-            "STEERED_LOGITS_BY_TOKEN": topk_steered_by_token,
+            "STEERED_LOGITS_BY_TOKEN": steered_result["STEERED_LOGITS_BY_TOKEN"],
             "DEFAULT_GENERATION": default_generation,
-            "STEERED_GENERATION": steered_generation,
+            "STEERED_GENERATION": steered_result["STEERED_GENERATION"],
         }
 
         return response
@@ -470,6 +520,51 @@ async def steer_handler(req: Request):
             print(
                 f"Thread {threading.get_ident()}: Lock was not held by current path in finally block (already released or never acquired)."
             )
+
+
+@app.post("/steer-batch", dependencies=[Depends(verify_secret_key)])
+async def steer_batch_handler(req: Request):
+    """Handle multiple steer requests for the same prompt in a single request."""
+    print("========== Steer Batch Start ==========")
+    if not request_lock.acquire(blocking=False):
+        return JSONResponse(
+            content={"error": "Server busy, please try again later."}, status_code=503
+        )
+
+    try:
+        request_body = await req.json()
+        req_data = SteerBatchRequest.model_validate(request_body)
+
+        if req_data.model_id != loaded_model_arg:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model '{req_data.model_id}' is not available. Only '{loaded_model_arg}' is currently loaded.",
+            )
+
+        sequence_length = len(model.tokenizer(req_data.prompt).input_ids)
+        for features in req_data.feature_sets:
+            _validate_steer_features(features, sequence_length)
+
+        _, activations = model.get_activations(req_data.prompt, sparse=True)
+        default_tokenized_str_tokens, default_generation, topk_default_by_token = _compute_default_run(
+            req_data, sequence_length
+        )
+
+        steered_results = []
+        for features in req_data.feature_sets:
+            intervention_tuples = _build_intervention_tuples(features, activations, sequence_length)
+            steered_results.append(
+                _compute_steered_run(req_data, sequence_length, intervention_tuples, default_tokenized_str_tokens)
+            )
+
+        return {
+            "DEFAULT_LOGITS_BY_TOKEN": topk_default_by_token,
+            "DEFAULT_GENERATION": default_generation,
+            "STEERED_RESULTS": steered_results,
+        }
+    finally:
+        if request_lock.locked():
+            request_lock.release()
 
 
 @app.post("/forward-pass", dependencies=[Depends(verify_secret_key)])
@@ -704,14 +799,15 @@ async def generate_graph(req: Request):
                 f"Thread {threading.get_ident()} (worker): Attribution Time: {attribution_time_ms:.2f}ms"
             )
 
-            _graph.to("cuda")
+            _prune_device = "cuda" if torch.cuda.is_available() else device
+            _graph.to(_prune_device)
 
             _node_mask, _edge_mask, _cumulative_scores = (
                 el.cpu() for el in prune_graph(_graph, node_threshold, edge_threshold)
             )
             _graph.to("cpu")
 
-            tokenizer = AutoTokenizer.from_pretrained(model.cfg.tokenizer_name)
+            tokenizer = get_shared_tokenizer()
 
             _nodes = create_nodes(
                 _graph,
@@ -734,6 +830,25 @@ async def generate_graph(req: Request):
                 tokenizer,
             )
             print("output model created")
+
+            # Optionally pre-build scorer and cache for /build-circuit endpoint.
+            # Bulk graph generation does not need this, and skipping it materially
+            # reduces both latency and memory pressure.
+            output_dict = _output_model.model_dump() if hasattr(_output_model, 'model_dump') else _output_model
+            if PREBUILD_SCORER_ON_GENERATE and isinstance(output_dict, dict) and 'nodes' in output_dict and 'links' in output_dict:
+                try:
+                    scorer = BatchGraphScorer(
+                        output_dict['nodes'], output_dict['links'], device_str=str(device),
+                    )
+                    _cache_graph_artifacts(slug_identifier, scorer, {
+                        'nodes': output_dict['nodes'],
+                        'links': output_dict['links'],
+                    })
+                    print(f"Cached scorer '{slug_identifier}' for /build-circuit ({len(output_dict['nodes'])} nodes)")
+                except Exception as e:
+                    print(f"Failed to cache scorer: {e}")
+            elif not PREBUILD_SCORER_ON_GENERATE:
+                print("Skipping scorer prebuild for /generate-graph")
 
             # if signed_url is not provided, we don't upload the file, just return the output model
             if req_data.signed_url is None:
@@ -869,3 +984,141 @@ async def generate_graph(req: Request):
             print(
                 f"Thread {threading.get_ident()}: Lock was not held by current path in finally block (already released or never acquired)."
             )
+
+
+# ============ Circuit Explorer ============
+
+
+class GroupNodesRequest(BaseModel):
+    graph_data: dict
+    pinned_ids: list[str]
+    prompt: str = ""
+    grouping_model: str = "sonnet"
+
+
+@app.post("/group-nodes", dependencies=[Depends(verify_secret_key)])
+async def group_nodes_handler(req: Request):
+    """Group pinned nodes into semantic supernodes using LLM."""
+    try:
+        request_body = await req.json()
+        req_data = GroupNodesRequest.model_validate(request_body)
+        nodes = req_data.graph_data.get("nodes", [])
+        links = req_data.graph_data.get("links", [])
+        sn, explanations, member_reasons, grouping_failed, grouping_error = await run_in_threadpool(
+            auto_group_nodes, nodes, links, req_data.pinned_ids, req_data.prompt, req_data.grouping_model,
+        )
+        return format_grouping_response(
+            sn,
+            explanations,
+            member_reasons,
+            req_data.grouping_model,
+            grouping_failed,
+            grouping_error,
+        )
+    except Exception as e:
+        print(f"Error in group-nodes: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class ExploreCircuitsRequest(BaseModel):
+    model_id: str
+    graph_data: dict
+    target_logit_node_id: str | None = None
+    endpoint_node_ids: list[str] = []
+    num_seeds: int = 5
+    max_iterations: int = 80
+    pc_passes: int = 1
+    keep_ratio: float = 0.4
+    grouping_model: str = "sonnet"
+
+
+@app.post("/score-circuit", dependencies=[Depends(verify_secret_key)])
+async def score_circuit(req: Request):
+    """Score circuit(s) using PyTorch. Pre-processes graph once, scores all pin sets."""
+    body = await req.json()
+    nodes = body.get('nodes', [])
+    links = body.get('links', [])
+    pinned_ids_list = body.get('pinnedIdsList', [])
+
+    scorer = BatchGraphScorer(nodes, links)
+    results = [scorer.score(pins) for pins in pinned_ids_list]
+
+    return JSONResponse(content={'results': results})
+
+
+# Cache: slug → pre-built scorer (avoids re-parsing graph data)
+_scorer_cache: "OrderedDict[str, BatchGraphScorer]" = OrderedDict()
+_graph_cache: "OrderedDict[str, dict]" = OrderedDict()
+
+
+@app.post("/build-circuit", dependencies=[Depends(verify_secret_key)])
+async def build_circuit(req: Request):
+    """
+    Build a circuit server-side using batched GPU scoring.
+    Runs IA greedy + pathway completion entirely on the server.
+    Pass graph data via JSON, or pass slug to use a cached pre-built scorer.
+    """
+    body = await req.json()
+    slug = body.get('slug')
+    nodes = body.get('nodes')
+    links = body.get('links')
+    endpoint_ids = body.get('endpointIds', [])
+    method = body.get('method', 'ia_pc')  # 'c_only', 'ia', 'ia_pc'
+    alpha = body.get('alpha', 0.15)
+    device_str = body.get('device', str(device))
+
+    import time as _time
+    _t0 = _time.time()
+
+    # Use cached pre-built scorer if slug matches
+    if slug and nodes is None:
+        scorer = _get_cached_scorer(slug)
+    else:
+        scorer = None
+
+    if scorer is not None:
+        print(f"[build-circuit] Using cached scorer for '{slug}' ({_time.time()-_t0:.3f}s)")
+    elif nodes is not None and links is not None:
+        scorer = BatchGraphScorer(nodes, links, device_str=device_str)
+        if slug:
+            _cache_graph_artifacts(slug, scorer, {'nodes': nodes, 'links': links})
+    else:
+        raise HTTPException(status_code=400, detail="Must provide nodes/links or a valid slug")
+
+    print(f"[build-circuit] Scorer ready, starting build ({_time.time()-_t0:.3f}s)")
+
+    def _do_build():
+        if method == 'ia_pc' or method == 'ia':
+            return scorer.build_circuit_ia_pc(
+                endpoint_ids, alpha=alpha,
+                pc_passes=3 if method == 'ia_pc' else 0,
+            )
+        else:
+            return scorer.build_circuit_ia_pc(
+                endpoint_ids, alpha=0.0,
+                pc_passes=0,
+            )
+
+    result = await run_in_threadpool(_do_build)
+
+    print(f"[build-circuit] Done: {result['totalFeatures']} features in {_time.time()-_t0:.3f}s")
+    return JSONResponse(content=result)
+
+
+@app.post("/explore-circuits", dependencies=[Depends(verify_secret_key)])
+async def explore_circuits_handler(req: Request):
+    """Explore multiple circuits and stream results as SSE events."""
+    print("========== Explore Circuits Start ==========")
+    request_body = await req.json()
+    req_data = ExploreCircuitsRequest.model_validate(request_body)
+    job = ExploreCircuitsJob(
+        graph_data=req_data.graph_data,
+        target_logit_node_id=req_data.target_logit_node_id,
+        endpoint_node_ids=req_data.endpoint_node_ids,
+        num_seeds=req_data.num_seeds,
+        max_iterations=req_data.max_iterations,
+        pc_passes=req_data.pc_passes,
+        keep_ratio=req_data.keep_ratio,
+        grouping_model=req_data.grouping_model,
+    )
+    return build_explore_circuits_response(job, device_str=str(device))

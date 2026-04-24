@@ -11,6 +11,7 @@ const nextConfig = {
   output: 'standalone', // for docker
   reactStrictMode: false,
   compress: true,
+  allowedDevOrigins: ['https://circuitexplorer.nimavaziri.com'],
   compiler: {
     // Remove console logs only in production
     removeConsole: process.env.NODE_ENV === 'production',

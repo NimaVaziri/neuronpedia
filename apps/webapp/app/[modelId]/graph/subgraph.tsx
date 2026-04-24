@@ -1,3 +1,5 @@
+/* eslint-disable no-param-reassign */
+
 import CustomTooltip from '@/components/custom-tooltip';
 import { useGraphModalContext } from '@/components/provider/graph-modal-provider';
 import { useGraphContext } from '@/components/provider/graph-provider';
@@ -7,24 +9,31 @@ import { Card, CardContent } from '@/components/shadcn/card';
 import { useScreenSize } from '@/lib/hooks/use-screen-size';
 import { QuestionMarkCircledIcon } from '@radix-ui/react-icons';
 import {
+  BarChart3,
+  ChevronDown,
+  ChevronUp,
   Circle,
   Expand,
   FolderOpen,
   Fullscreen,
   Joystick,
+  Loader2,
   Minimize2,
   PinIcon,
   PinOffIcon,
   Save,
   Share2,
+  TestTube2,
   TrashIcon,
   ZoomInIcon,
   ZoomOutIcon,
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { CircuitCausalityResult, validatePinnedCircuit } from './causal-validation';
+import CircuitCausalityResultView from './circuit-causality-result';
+import { useCircuitExplorerContext } from './features/circuit-explorer/context';
 import d3 from './d3-jetpack';
 import { CLTGraphLink, CLTGraphNode } from './graph-types';
-import { computeGraphScoresInWorker } from './score-worker-client';
 import {
   clientCheckIsEmbed,
   hideTooltip,
@@ -97,7 +106,12 @@ interface SubgraphLink extends CLTGraphLink {
   targetOffsetX?: number;
 }
 
-export default function Subgraph() {
+type SubgraphProps = {
+  showFidelitySidebar: boolean;
+  setShowFidelitySidebar: (show: boolean) => void;
+};
+
+export default function Subgraph({ showFidelitySidebar, setShowFidelitySidebar }: SubgraphProps) {
   const svgRef = useRef<SVGSVGElement>(null);
   const divRef = useRef<HTMLDivElement>(null);
   const {
@@ -110,6 +124,9 @@ export default function Subgraph() {
     makeTooltipText,
     resetSelectedGraphToBlankVisState,
     selectedModelId,
+    selectedSourceSetName,
+    graphScores,
+    subgraphScores,
   } = useGraphContext();
 
   // Use the new graph state context
@@ -129,6 +146,7 @@ export default function Subgraph() {
     openWelcomeModalToStep,
     setIsSteerModalOpen,
   } = useGraphModalContext();
+  const { setIsExploreCircuitsModalOpen } = useCircuitExplorerContext();
 
   const simulationRef = useRef<d3.Simulation<ForceNode, undefined> | null>(null);
   const nodeSelRef = useRef<d3.Selection<HTMLDivElement, ForceNode, HTMLDivElement, unknown> | null>(null);
@@ -145,6 +163,46 @@ export default function Subgraph() {
   // State to track current hover/click values for triggering effects
   const [currentHoveredId, setCurrentHoveredId] = useState<string | null>(null);
   const [currentClickedId, setCurrentClickedId] = useState<string | null>(null);
+  const [circuitValidation, setCircuitValidation] = useState<CircuitCausalityResult | null>(null);
+  const [isValidatingCircuit, setIsValidatingCircuit] = useState(false);
+  const [circuitValidationError, setCircuitValidationError] = useState<string | null>(null);
+  const [showCircuitValidationDetails, setShowCircuitValidationDetails] = useState(true);
+
+  const canTestCurrentCircuit =
+    !!selectedGraph &&
+    STEER_MODEL_IDS.includes(selectedGraph.metadata.scan) &&
+    !isOldQwenGraph(selectedGraph) &&
+    visState.pinnedIds.length > 0;
+  const validateCurrentCircuit = useCallback(async () => {
+    if (!selectedGraph || !canTestCurrentCircuit || isValidatingCircuit) return;
+    setIsValidatingCircuit(true);
+    setCircuitValidationError(null);
+    try {
+      const validation = await validatePinnedCircuit({
+        selectedGraph,
+        selectedModelId,
+        selectedSourceSetName,
+        pinnedIds: visState.pinnedIds,
+      });
+      setCircuitValidation(validation);
+    } catch (err) {
+      setCircuitValidationError((err as Error).message || 'Failed to test causality');
+    } finally {
+      setIsValidatingCircuit(false);
+    }
+  }, [
+    canTestCurrentCircuit,
+    isValidatingCircuit,
+    selectedGraph,
+    selectedModelId,
+    selectedSourceSetName,
+    visState.pinnedIds,
+  ]);
+
+  useEffect(() => {
+    setCircuitValidation(null);
+    setCircuitValidationError(null);
+  }, [selectedGraph, visState.pinnedIds]);
 
   // Register callbacks to be notified when hover/click state changes
   useEffect(() => {
@@ -168,59 +226,6 @@ export default function Subgraph() {
   const isEditingLabelRef = useRef(isEditingLabel);
 
   const screenSize = useScreenSize();
-
-  // Web worker compute via helper
-  const latestRequestIdRef = useRef(0);
-  const [subgraphScores, setSubgraphScores] = useState({ replacementScore: 0, completenessScore: 0 });
-
-  // Web worker compute for overall graph scores
-  const [graphScores, setGraphScores] = useState({ replacementScore: 0, completenessScore: 0 });
-
-  useEffect(() => {
-    if (!selectedGraph) {
-      setGraphScores({ replacementScore: 0, completenessScore: 0 });
-      return;
-    }
-
-    // Use existing scores if available
-    if (
-      selectedGraph.metadata.replacement_score !== undefined &&
-      selectedGraph.metadata.completeness_score !== undefined
-    ) {
-      setGraphScores({
-        replacementScore: selectedGraph.metadata.replacement_score,
-        completenessScore: selectedGraph.metadata.completeness_score,
-      });
-      return;
-    }
-
-    // Compute scores in web worker for the full graph (no pinned nodes)
-    computeGraphScoresInWorker(selectedGraph, [])
-      .then(({ replacementScore, completenessScore }) => {
-        setGraphScores({ replacementScore, completenessScore });
-      })
-      .catch(() => {
-        setGraphScores({ replacementScore: 0, completenessScore: 0 });
-      });
-  }, [selectedGraph]);
-
-  useEffect(() => {
-    if (!selectedGraph) {
-      setSubgraphScores({ replacementScore: 0, completenessScore: 0 });
-      return;
-    }
-    latestRequestIdRef.current += 1;
-    const requestId = latestRequestIdRef.current;
-    computeGraphScoresInWorker(selectedGraph, visState.pinnedIds)
-      .then(({ replacementScore, completenessScore }) => {
-        if (requestId !== latestRequestIdRef.current) return;
-        setSubgraphScores({ replacementScore, completenessScore });
-      })
-      .catch(() => {
-        if (requestId !== latestRequestIdRef.current) return;
-        setSubgraphScores({ replacementScore: 0, completenessScore: 0 });
-      });
-  }, [selectedGraph, visState.pinnedIds]);
 
   // Helper to create pct input color function
   const pctInputColorFn = useCallback((d: number) => {
@@ -1192,23 +1197,31 @@ export default function Subgraph() {
     }
 
     // Apply styles based on the potentially updated tmpClickedLink property
+    const suffAddedSet = new Set(visState.sufficiencyAddedIds || []);
     memberNodeSel
       .classed('clicked', (d: CLTGraphNode) => d.nodeId === currentClickedId)
       .classed('hovered', (d: CLTGraphNode) => d.nodeId === currentHoveredId)
-      .style('background', (d: CLTGraphNode) =>
-        d.feature_type === 'lorsa' ? 'transparent' : d?.tmpClickedLink?.pctInputColor || '#fff',
-      )
-      .style('color', (d: CLTGraphNode) =>
-        d.feature_type === 'lorsa'
-          ? d?.tmpClickedLink?.pctInputColor || '#fff'
-          : bgColorToTextColor(d?.tmpClickedLink?.pctInputColor) || 'black',
-      );
+      .style('background', (d: CLTGraphNode) => {
+        if (d.nodeId && suffAddedSet.has(d.nodeId)) return '#86efac';
+        if (d.feature_type === 'lorsa') return 'transparent';
+        return d?.tmpClickedLink?.pctInputColor || '#fff';
+      })
+      .style('color', (d: CLTGraphNode) => {
+        if (d.nodeId && suffAddedSet.has(d.nodeId)) return '#14532d';
+        if (d.feature_type === 'lorsa') return d?.tmpClickedLink?.pctInputColor || '#fff';
+        return bgColorToTextColor(d?.tmpClickedLink?.pctInputColor) || 'black';
+      })
+      .style('border-color', (d: CLTGraphNode) => {
+        if (d.nodeId && suffAddedSet.has(d.nodeId)) return '#16a34a';
+        return null;
+      });
 
     // NOTE: This effect intentionally avoids restarting the simulation or changing layout.
   }, [
     currentClickedId,
     currentHoveredId,
     visState.subgraph?.activeGrouping.selectedNodeIds,
+    visState.sufficiencyAddedIds,
     bgColorToTextColor,
     nodeIdToNode,
   ]);
@@ -1337,7 +1350,7 @@ export default function Subgraph() {
       >
         <CardContent className="relative h-full px-0 py-0">
           {selectedGraph && MODELS_TO_CALCULATE_REPLACEMENT_SCORES.has(selectedModelId) && (
-            <div className="absolute bottom-1 left-0 hidden w-full flex-row items-center justify-center gap-x-1.5 px-5 text-[9px] text-slate-500 sm:flex">
+            <div className="absolute bottom-1 left-0 z-10 hidden w-full flex-row items-center justify-center gap-x-1.5 px-5 text-[9px] text-slate-500 sm:flex">
               <div className="flex flex-1 flex-row items-center justify-center gap-x-3">
                 <div className="z-10 flex flex-row items-center justify-center gap-x-0.5">
                   <div className="text-center font-bold leading-tight">Replacement Score</div>
@@ -1553,7 +1566,7 @@ export default function Subgraph() {
               </Button>
             </div>
 
-            <div className="absolute right-3 top-3 flex flex-col gap-x-2 gap-y-2">
+            <div className="absolute right-3 top-3 flex flex-col items-end gap-x-2 gap-y-2">
               <Button
                 variant="outline"
                 size="sm"
@@ -1615,25 +1628,72 @@ export default function Subgraph() {
                 Grouping Mode
               </Button>
               {selectedGraph && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => {
-                    setIsSteerModalOpen(true);
-                  }}
-                  className={`hidden h-11 w-[86px] flex-col items-center justify-center gap-y-[4px] whitespace-nowrap border border-emerald-600 bg-emerald-100 px-0 text-[9.5px] font-semibold leading-none text-emerald-700 shadow transition-all hover:bg-emerald-200 hover:text-emerald-700 ${
-                    visState.subgraph?.activeGrouping.isActive
-                      ? ''
-                      : !STEER_MODEL_IDS.includes(selectedGraph.metadata.scan) || isOldQwenGraph(selectedGraph)
+                <>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setIsSteerModalOpen(true);
+                    }}
+                    className={`hidden h-11 w-[86px] flex-col items-center justify-center gap-y-[4px] whitespace-nowrap border border-emerald-600 bg-emerald-100 px-0 text-[9.5px] font-semibold leading-none text-emerald-700 shadow transition-all hover:bg-emerald-200 hover:text-emerald-700 ${
+                      visState.subgraph?.activeGrouping.isActive
                         ? ''
-                        : 'sm:flex'
-                  }`}
-                  disabled={visState.pinnedIds.length === 0}
-                  aria-label="Steer"
-                >
-                  <Joystick className="h-3.5 w-3.5" />
-                  Steer
-                </Button>
+                        : !STEER_MODEL_IDS.includes(selectedGraph.metadata.scan) || isOldQwenGraph(selectedGraph)
+                          ? ''
+                          : 'sm:flex'
+                    }`}
+                    disabled={visState.pinnedIds.length === 0}
+                    aria-label="Steer"
+                  >
+                    <Joystick className="h-3.5 w-3.5" />
+                    Steer
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={validateCurrentCircuit}
+                    className={`hidden h-11 w-[86px] flex-col items-center justify-center gap-y-[4px] whitespace-nowrap border border-violet-600 bg-violet-100 px-0 text-[9.5px] font-semibold leading-none text-violet-700 shadow transition-all hover:bg-violet-200 hover:text-violet-700 disabled:opacity-50 ${
+                      visState.subgraph?.activeGrouping.isActive
+                        ? ''
+                        : !STEER_MODEL_IDS.includes(selectedGraph.metadata.scan) || isOldQwenGraph(selectedGraph)
+                          ? ''
+                          : 'sm:flex'
+                    }`}
+                    disabled={!canTestCurrentCircuit || isValidatingCircuit}
+                    aria-label="Test Causality"
+                  >
+                    {isValidatingCircuit ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <TestTube2 className="h-3.5 w-3.5" />
+                    )}
+                    {isValidatingCircuit ? 'Testing...' : 'Test Causality'}
+                  </Button>
+                  {(circuitValidation || circuitValidationError) && (
+                    <div className="hidden w-[280px] rounded-md border border-violet-100 bg-white p-2 text-left shadow-lg sm:block">
+                      <button
+                        type="button"
+                        onClick={() => setShowCircuitValidationDetails(!showCircuitValidationDetails)}
+                        className="mb-1 flex w-full items-center justify-between gap-x-2 rounded text-left transition-colors hover:bg-slate-50"
+                        aria-expanded={showCircuitValidationDetails}
+                      >
+                        <span className="text-[11px] font-semibold text-slate-700">Shown Circuit Causality</span>
+                        {showCircuitValidationDetails ? (
+                          <ChevronUp className="h-3.5 w-3.5 text-slate-400" />
+                        ) : (
+                          <ChevronDown className="h-3.5 w-3.5 text-slate-400" />
+                        )}
+                      </button>
+                      {showCircuitValidationDetails ? (
+                        circuitValidationError ? (
+                          <div className="text-[11px] text-red-600">{circuitValidationError}</div>
+                        ) : circuitValidation ? (
+                          <CircuitCausalityResultView validation={circuitValidation} compact />
+                        ) : null
+                      ) : null}
+                    </div>
+                  )}
+                </>
               )}
             </div>
 
@@ -1702,6 +1762,35 @@ export default function Subgraph() {
                   Share
                 </Button>
               )}
+              <Button
+                variant="outline"
+                size="sm"
+                title="Explore Circuits"
+                aria-label="Explore Circuits"
+                className="h-9 flex-col items-center justify-center gap-y-[1px] whitespace-nowrap rounded-md border-0 bg-sky-600 px-4 text-[9px] font-bold leading-none text-white shadow-md hover:bg-sky-700 hover:shadow-lg"
+                onClick={() => {
+                  setIsExploreCircuitsModalOpen(true);
+                }}
+              >
+                <Expand className="h-4 w-4" />
+                Circuit Explorer
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                title={showFidelitySidebar ? 'Hide Fidelity Sidebar' : 'Show Fidelity Sidebar'}
+                aria-label={showFidelitySidebar ? 'Hide Fidelity Sidebar' : 'Show Fidelity Sidebar'}
+                aria-pressed={showFidelitySidebar}
+                className={`h-9 w-9 flex-col items-center justify-center gap-y-[1px] whitespace-nowrap border-none px-0 text-[8px] font-medium leading-none transition-colors ${
+                  showFidelitySidebar
+                    ? 'bg-slate-700 text-white hover:bg-slate-800 hover:text-white'
+                    : 'bg-slate-100 text-slate-500 hover:bg-slate-200 hover:text-slate-600'
+                }`}
+                onClick={() => setShowFidelitySidebar(!showFidelitySidebar)}
+              >
+                <BarChart3 className="h-4 w-4" />
+                Fidelity
+              </Button>
               <Button
                 variant="outline"
                 size="sm"

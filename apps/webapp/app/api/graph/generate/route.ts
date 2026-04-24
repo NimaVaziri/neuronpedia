@@ -1,20 +1,28 @@
+import fs from 'fs';
+import path from 'path';
 import { CLTGraph } from '@/app/[modelId]/graph/graph-types';
 import { ATTRIBUTION_GRAPH_SCHEMA, makeGraphPublicAccessGraphUrl, NP_GRAPH_BUCKET } from '@/app/[modelId]/graph/utils';
 import { prisma } from '@/lib/db';
 import {
+  getAuthHeaderForGraphServerRequest,
+  getGraphServerRequestUrlForSourceSet,
   getGraphServerRunpodHostForSourceSet,
   getIsRunpodServerlessHostForSourceSet,
 } from '@/lib/db/graph-host-source';
+import { USE_LOCALHOST_GRAPH } from '@/lib/env';
 import { getModelById } from '@/lib/db/model';
 import {
   checkRunpodQueueJobs,
   generateGraphAndUploadToS3,
   getGraphTokenize,
   GRAPH_ANONYMOUS_USER_ID,
+  GRAPH_BATCH_SIZE,
   GRAPH_MAX_TOKENS,
+  GRAPH_MODEL_MAP,
   GRAPH_S3_USER_GRAPHS_DIR,
   GRAPH_SLUG_MIN,
   graphGenerateSchemaClient,
+  LORSA_BATCH_SIZE,
   LORSA_MAX_TOKENS,
   LORSA_MODELS,
   MAX_RUNPOD_JOBS_IN_QUEUE,
@@ -266,94 +274,128 @@ export const POST = withOptionalUser(async (request: RequestOptionalUser) => {
       );
     }
 
-    // make a signed put for this user
-
     const userId = request.user?.id;
     const userName = request.user?.name;
 
-    const key = `${GRAPH_S3_USER_GRAPHS_DIR}/${userId || GRAPH_ANONYMOUS_USER_ID}/${validatedData.slug}-${Date.now()}.json`;
+    let graph: CLTGraph;
+    let graphUrl: string;
 
-    // Initialize S3 client
-    const s3Client = new S3Client({
-      region: process.env.AWS_REGION || 'us-east-1',
-      credentials: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
-      },
-    });
+    if (USE_LOCALHOST_GRAPH) {
+      // Localhost: call graph server directly without S3, save to public dir
+      const isRunpod = await getIsRunpodServerlessHostForSourceSet(validatedData.modelId, validatedData.sourceSetName);
+      const url = await getGraphServerRequestUrlForSourceSet(validatedData.modelId, validatedData.sourceSetName, 'generate-graph', isRunpod);
+      const mappedModelId = GRAPH_MODEL_MAP[validatedData.modelId as keyof typeof GRAPH_MODEL_MAP] || validatedData.modelId;
+      const isLorsa = LORSA_MODELS.includes(validatedData.modelId);
+      const graphResponse = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaderForGraphServerRequest(isRunpod),
+        },
+        body: JSON.stringify({
+          prompt: validatedData.prompt,
+          model_id: mappedModelId,
+          batch_size: isLorsa ? LORSA_BATCH_SIZE : GRAPH_BATCH_SIZE,
+          max_n_logits: validatedData.maxNLogits,
+          desired_logit_prob: validatedData.desiredLogitProb,
+          node_threshold: validatedData.nodeThreshold,
+          edge_threshold: validatedData.edgeThreshold,
+          slug_identifier: validatedData.slug,
+          max_feature_nodes: validatedData.maxFeatureNodes,
+          signed_url: null,
+          user_id: userName || 'Anonymous (CT)',
+          ...(isLorsa
+            ? {
+                enable_qk_tracing: true,
+                qk_top_fraction: validatedData.qkTopFraction,
+                qk_topk: validatedData.qkTopk,
+              }
+            : {}),
+        }),
+      });
 
-    // Create the command for putting an object
-    const command = new PutObjectCommand({
-      Bucket: NP_GRAPH_BUCKET,
-      Key: key,
-      ContentType: 'application/json',
-    });
-
-    // Generate the presigned URL for 1 hour
-    const signedUrl = await getSignedUrl(s3Client, command, {
-      expiresIn: 3600, // 1 hour
-    });
-
-    // check the queue
-    const isRunpodServerlessHost = await getIsRunpodServerlessHostForSourceSet(
-      validatedData.modelId,
-      validatedData.sourceSetName,
-    );
-    if (isRunpodServerlessHost) {
-      const host = await getGraphServerRunpodHostForSourceSet(validatedData.modelId, validatedData.sourceSetName);
-      if (!host) {
-        throw new Error('No runpod serverless host found.');
-      }
-      const queueNumber = await checkRunpodQueueJobs(host);
-      if (queueNumber > MAX_RUNPOD_JOBS_IN_QUEUE) {
-        // console.log('larger than queue but continuing');
+      if (!graphResponse.ok) {
+        const errText = await graphResponse.text();
         return NextResponse.json(
-          {
-            error: RUNPOD_BUSY_ERROR,
-            message: RUNPOD_BUSY_ERROR,
-          },
-          { status: 503 },
+          { error: 'Graph generation failed', message: errText },
+          { status: 500 },
         );
       }
-    }
 
-    await generateGraphAndUploadToS3(
-      validatedData.prompt,
-      validatedData.modelId,
-      validatedData.sourceSetName,
-      validatedData.maxNLogits,
-      validatedData.desiredLogitProb,
-      validatedData.nodeThreshold,
-      validatedData.edgeThreshold,
-      validatedData.slug,
-      validatedData.maxFeatureNodes,
-      signedUrl,
-      userName || 'Anonymous (CT)',
-      validatedData.qkTopFraction,
-      validatedData.qkTopk,
-    );
+      graph = (await graphResponse.json()) as CLTGraph;
 
-    // download the file from S3
-    const cleanUrl = signedUrl.split('?')[0];
-    const response = await fetch(cleanUrl);
-    if (!response.ok) {
-      return NextResponse.json(
-        {
-          error: 'Failed to download graph.',
-          message: `Failed to download graph. HTTP ${response.status}: ${response.statusText}`,
+      // Save to public/graph-data for local serving
+      const graphDir = path.join(process.cwd(), 'public', 'graph-data');
+      if (!fs.existsSync(graphDir)) fs.mkdirSync(graphDir, { recursive: true });
+      const filename = `${validatedData.slug}.json`;
+      fs.writeFileSync(path.join(graphDir, filename), JSON.stringify(graph));
+      graphUrl = `/graph-data/${filename}`;
+    } else {
+      // Production: use S3 signed URL
+      const key = `${GRAPH_S3_USER_GRAPHS_DIR}/${userId || GRAPH_ANONYMOUS_USER_ID}/${validatedData.slug}.json`;
+      const s3Client = new S3Client({
+        region: process.env.AWS_REGION || 'us-east-1',
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
         },
-        { status: 500 },
+      });
+      const command = new PutObjectCommand({
+        Bucket: NP_GRAPH_BUCKET,
+        Key: key,
+        ContentType: 'application/json',
+      });
+      const signedUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
+
+      const isRunpodServerlessHost = await getIsRunpodServerlessHostForSourceSet(validatedData.modelId, validatedData.sourceSetName);
+      if (isRunpodServerlessHost) {
+        const host = await getGraphServerRunpodHostForSourceSet(validatedData.modelId, validatedData.sourceSetName);
+        if (!host) {
+          throw new Error('No runpod serverless host found.');
+        }
+        const queueNumber = await checkRunpodQueueJobs(host);
+        if (queueNumber > MAX_RUNPOD_JOBS_IN_QUEUE) {
+          return NextResponse.json(
+            { error: RUNPOD_BUSY_ERROR, message: RUNPOD_BUSY_ERROR },
+            { status: 503 },
+          );
+        }
+      }
+
+      await generateGraphAndUploadToS3(
+        validatedData.prompt,
+        validatedData.modelId,
+        validatedData.sourceSetName,
+        validatedData.maxNLogits,
+        validatedData.desiredLogitProb,
+        validatedData.nodeThreshold,
+        validatedData.edgeThreshold,
+        validatedData.slug,
+        validatedData.maxFeatureNodes,
+        signedUrl,
+        userName || 'Anonymous (CT)',
+        validatedData.qkTopFraction,
+        validatedData.qkTopk,
       );
+
+      const cleanUrl = signedUrl.split('?')[0];
+      const response = await fetch(cleanUrl);
+      if (!response.ok) {
+        return NextResponse.json(
+          { error: 'Failed to download graph.', message: `HTTP ${response.status}: ${response.statusText}` },
+          { status: 500 },
+        );
+      }
+      graph = (await response.json()) as CLTGraph;
+      graphUrl = cleanUrl;
     }
-    const responseJson = await response.json();
-    const graph = responseJson as CLTGraph;
 
     // Validate the graph against the JSON schema
     const ajv = new Ajv({ allErrors: true, strict: false });
     const validate = ajv.compile(ATTRIBUTION_GRAPH_SCHEMA);
 
     // Create a deep copy of the data to avoid mutation during validation
-    const dataCopy = JSON.parse(JSON.stringify(responseJson));
+    const dataCopy = JSON.parse(JSON.stringify(graph));
 
     const isValid = validate(dataCopy);
 
@@ -385,7 +427,7 @@ export const POST = withOptionalUser(async (request: RequestOptionalUser) => {
         titlePrefix: '',
         promptTokens: graph.metadata.prompt_tokens,
         prompt: graph.metadata.prompt,
-        url: cleanUrl,
+        url: graphUrl,
         isFeatured: false,
       },
       create: {
@@ -396,14 +438,14 @@ export const POST = withOptionalUser(async (request: RequestOptionalUser) => {
         titlePrefix: '',
         promptTokens: graph.metadata.prompt_tokens,
         prompt: graph.metadata.prompt,
-        url: cleanUrl,
+        url: graphUrl,
         isFeatured: false,
       },
     });
 
     return NextResponse.json({
       message: 'Graph saved to database',
-      s3url: cleanUrl,
+      s3url: graphUrl,
       url: makeGraphPublicAccessGraphUrl(graph.metadata.scan, graph.metadata.slug),
       numNodes: graph.nodes.length,
       numLinks: graph.links.length,

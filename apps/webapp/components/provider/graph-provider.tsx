@@ -6,8 +6,10 @@ import {
   CLTGraphNode,
   CltVisState,
   FilterGraphType,
+  GraphScores,
   ModelToGraphMetadatasMap,
 } from '@/app/[modelId]/graph/graph-types';
+import { computeGraphScoresInWorker } from '@/app/[modelId]/graph/score-worker-client';
 import {
   ANTHROPIC_MODEL_TO_DISPLAY_NAME,
   ANTHROPIC_MODEL_TO_NUM_LAYERS,
@@ -15,8 +17,10 @@ import {
   formatCLTGraphData,
   getIndexFromCantorValue,
   getIndexFromFeatureAndGraph,
+  getLayerFromFeatureAndGraph,
   getLayerFromOldSchema0Feature,
   isHideLayer,
+  MODELS_TO_CALCULATE_REPLACEMENT_SCORES,
   nodeTypeHasFeatureDetail,
   parseGraphClerps,
   parseGraphSupernodes,
@@ -114,6 +118,25 @@ type GraphContextType = {
   resetSelectedGraphToBlankVisState: () => void;
 
   loadSubgraph: (subgraph: GraphMetadataSubgraphWithPartialRelations) => void;
+
+  // Fidelity scores
+  graphScores: GraphScores;
+  subgraphScores: GraphScores;
+
+  // Ablation state
+  ablatedNodeIds: Set<string>;
+  toggleAblation: (nodeId: string) => void;
+  ablationResult: AblationResult | null;
+  ablationError: string | null;
+  isAblating: boolean;
+  runAblation: () => void;
+};
+
+export type AblationResult = {
+  defaultGeneration: string;
+  steeredGeneration: string;
+  defaultLogits: Array<{ token: string; top_logits: Array<{ prob: number; token: string }> }>;
+  steeredLogits: Array<{ token: string; top_logits: Array<{ prob: number; token: string }> }>;
 };
 
 // Create the context with a default value
@@ -231,8 +254,158 @@ export function GraphProvider({
     supernodes: initialSupernodes || [],
     clerps: initialClerps || [],
 
+    showErrorNodes: true,
     densityThreshold: 1,
   });
+
+  // Fidelity scores - shared across dashboard, subgraph, and link-graph
+  const defaultScores: GraphScores = {
+    replacementScore: 0,
+    completenessScore: 0,
+    errorNodeInfluences: [],
+    suggestedPinIds: [],
+    errorEdgeAnalysis: { leakingPins: [], unexplainedPins: [], bridgeCandidates: [] },
+  };
+  const [graphScores, setGraphScores] = useState<GraphScores>(defaultScores);
+  const [subgraphScores, setSubgraphScores] = useState<GraphScores>(defaultScores);
+
+  // Ablation state — tracks which features are currently ablated
+  const [ablatedNodeIds, setAblatedNodeIds] = useState<Set<string>>(new Set());
+  const toggleAblation = useCallback((nodeId: string) => {
+    setAblatedNodeIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(nodeId)) {
+        next.delete(nodeId);
+      } else {
+        next.add(nodeId);
+      }
+      return next;
+    });
+    // Clear stale ablation results — user must re-run after changing ablated features
+    setAblationResult(null);
+    setAblationError(null);
+  }, []);
+  const [ablationResult, setAblationResult] = useState<AblationResult | null>(null);
+  const [ablationError, setAblationError] = useState<string | null>(null);
+  const [isAblating, setIsAblating] = useState(false);
+
+  const runAblation = useCallback(() => {
+    if (!selectedGraph || ablatedNodeIds.size === 0) {
+      setAblationResult(null);
+      return;
+    }
+
+    const features = Array.from(ablatedNodeIds)
+      .map((nodeId) => {
+        const node = selectedGraph.nodes.find((n) => n.nodeId === nodeId || n.node_id === nodeId);
+        if (!node || node.feature_type !== 'cross layer transcoder') return null;
+        return {
+          layer: getLayerFromFeatureAndGraph(selectedModelId, node, selectedGraph),
+          index: getIndexFromFeatureAndGraph(selectedModelId, node, selectedGraph),
+          token_active_position: node.ctx_idx,
+          steer_position: node.ctx_idx,
+          steer_generated_tokens: false,
+          delta: null,
+          ablate: true,
+        };
+      })
+      .filter((f): f is NonNullable<typeof f> => f !== null);
+
+    if (features.length === 0) return;
+
+    // Request enough top-k to cover all logit nodes in the graph
+    const numLogitNodes = selectedGraph.nodes.filter((n) => n.feature_type === 'logit').length;
+    const topK = Math.max(numLogitNodes, 10);
+
+    setIsAblating(true);
+    setAblationError(null);
+    fetch('/api/steer-logits', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        modelId: selectedGraph.metadata.scan,
+        sourceSetName: selectedSourceSetName || null,
+        prompt: selectedGraph.metadata.prompt.replaceAll('<bos>', ''),
+        features,
+        nTokens: 10,
+        topK,
+        freezeAttention: false,
+        temperature: 0.8,
+        freqPenalty: 0,
+        seed: null,
+        steeredOutputOnly: false,
+      }),
+    })
+      .then(async (res) => {
+        const text = await res.text();
+        if (!res.ok) {
+          throw new Error(`Steer API returned ${res.status}: ${text}`);
+        }
+        return JSON.parse(text);
+      })
+      .then((data) => {
+        setAblationResult({
+          defaultGeneration: data.DEFAULT_GENERATION,
+          steeredGeneration: data.STEERED_GENERATION,
+          defaultLogits: data.DEFAULT_LOGITS_BY_TOKEN || [],
+          steeredLogits: data.STEERED_LOGITS_BY_TOKEN || [],
+        });
+        setIsAblating(false);
+      })
+      .catch((err) => {
+        console.error('Ablation error:', err);
+        setAblationError(err.message || 'Unknown error');
+        setIsAblating(false);
+      });
+  }, [selectedGraph, selectedModelId, selectedSourceSetName, ablatedNodeIds]);
+  const latestScoreRequestIdRef = useRef(0);
+
+  // Compute full-graph scores when graph changes
+  useEffect(() => {
+    if (!selectedGraph || !MODELS_TO_CALCULATE_REPLACEMENT_SCORES.has(selectedModelId)) {
+      setGraphScores(defaultScores);
+      return;
+    }
+    if (
+      selectedGraph.metadata.replacement_score !== undefined &&
+      selectedGraph.metadata.completeness_score !== undefined
+    ) {
+      setGraphScores({
+        replacementScore: selectedGraph.metadata.replacement_score,
+        completenessScore: selectedGraph.metadata.completeness_score,
+        errorNodeInfluences: [],
+        suggestedPinIds: [],
+        errorEdgeAnalysis: { leakingPins: [], unexplainedPins: [], bridgeCandidates: [] },
+      });
+      return;
+    }
+    computeGraphScoresInWorker(selectedGraph, [])
+      .then((result) => {
+        setGraphScores(result);
+      })
+      .catch(() => {
+        setGraphScores(defaultScores);
+      });
+  }, [selectedGraph, selectedModelId]);
+
+  // Recompute subgraph scores when pinned nodes change
+  useEffect(() => {
+    if (!selectedGraph || !MODELS_TO_CALCULATE_REPLACEMENT_SCORES.has(selectedModelId)) {
+      setSubgraphScores(defaultScores);
+      return;
+    }
+    latestScoreRequestIdRef.current += 1;
+    const requestId = latestScoreRequestIdRef.current;
+    computeGraphScoresInWorker(selectedGraph, visState.pinnedIds)
+      .then((result) => {
+        if (requestId !== latestScoreRequestIdRef.current) return;
+        setSubgraphScores(result);
+      })
+      .catch(() => {
+        if (requestId !== latestScoreRequestIdRef.current) return;
+        setSubgraphScores(defaultScores);
+      });
+  }, [selectedGraph, visState.pinnedIds, selectedModelId]);
 
   const getOriginalClerpForNode = (node: CLTGraphNode) => {
     if (node.featureDetailNP) {
@@ -288,7 +461,28 @@ export function GraphProvider({
     const lorsaLine = node.feature_type === 'lorsa' ? '▲ Attn/Lorsa Node' : '';
     const layerLine =
       node.layer === 'E' ? 'Emb' : node.layer === 'Lgt' ? 'Logit' : `${node.isSuperNode ? '' : `Layer ${node.layer}`}`;
-    return [explanationLine, lorsaLine, layerLine].filter((l) => l && l.length > 0).join(' <br/> ');
+    let text = [explanationLine, lorsaLine, layerLine].filter((l) => l && l.length > 0).join(' <br/> ');
+
+    // Show ablated probability for logit nodes
+    if (node.feature_type === 'logit' && node.logitToken && ablationResult) {
+      const firstWithLogits = ablationResult.steeredLogits.find(
+        (l) => l.top_logits && l.top_logits.length > 0,
+      );
+      if (firstWithLogits) {
+        const logitToken = node.logitToken;
+        const match = firstWithLogits.top_logits.find(
+          (l) => l.token === logitToken || l.token.trim() === logitToken || l.token === logitToken.trim(),
+        );
+        if (match) {
+          const origPct = ((node.logitPct || 0) * 100).toFixed(1);
+          const ablatedPct = (match.prob * 100).toFixed(1);
+          const color = match.prob < (node.logitPct || 0) ? '#dc2626' : '#16a34a';
+          text += `<br/><span style="color:${color}">Ablated: ${origPct}% → ${ablatedPct}%</span>`;
+        }
+      }
+    }
+
+    return text;
   };
 
   const getFilterGraphTypeForCurrentUser = (graph: GraphMetadata) => {
@@ -388,6 +582,7 @@ export function GraphProvider({
     isGridsnap: false,
     supernodes: [],
     clerps: [],
+    showErrorNodes: true,
   };
 
   function getGraphDefaultVisState(graph: CLTGraph) {
@@ -653,6 +848,10 @@ export function GraphProvider({
     }
     const data = dataJson as CLTGraph;
     const formattedData = formatCLTGraphData(data, logitDiff);
+    const shouldDeferNodePrefetch = formattedData.nodes.length > 1000;
+    console.log(
+      `[getGraph] loaded ${graphSlug}: nodes=${formattedData.nodes.length}, links=${formattedData.links.length}, deferNodePrefetch=${shouldDeferNodePrefetch}`,
+    );
 
     formattedData.metadata.neuronpedia_internal_model = {
       id: selectedModelId,
@@ -686,47 +885,68 @@ export function GraphProvider({
         });
 
       // split the features into batches of NEURONPEDIA_FEATURE_DETAIL_DOWNLOAD_BATCH_SIZE
-      const batches = [];
+      const batches: typeof features[] = [];
       for (let i = 0; i < features.length; i += NEURONPEDIA_FEATURE_DETAIL_DOWNLOAD_BATCH_SIZE) {
         batches.push(features.slice(i, i + NEURONPEDIA_FEATURE_DETAIL_DOWNLOAD_BATCH_SIZE));
       }
 
-      // call /api/features in batches, sequentially
-      const batchesOfDetails = [];
-      setLoadingGraphLabel(`Loading ${features.length} Nodes... `);
-      for (const batch of batches) {
-        const resp = await fetch('/api/features', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(batch),
-          signal: abortSignal,
-        });
-        if (abortSignal?.aborted) {
-          throw new Error('Request cancelled after /api/features batch fetch');
+      const populateNeuronpediaNodeDetails = async () => {
+        const batchesOfDetails: NeuronWithPartialRelations[][] = [];
+        setLoadingGraphLabel(`Loading ${features.length} Nodes... `);
+        for (const batch of batches) {
+          const resp = await fetch('/api/features', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(batch),
+            signal: abortSignal,
+          });
+          if (abortSignal?.aborted) {
+            throw new Error('Request cancelled after /api/features batch fetch');
+          }
+          const da = (await resp.json()) as NeuronWithPartialRelations[];
+          batchesOfDetails.push(da);
         }
-        const da = (await resp.json()) as NeuronWithPartialRelations[];
-        batchesOfDetails.push(da);
+
+        const featureDetails = batchesOfDetails.flat(1);
+        allNodes.forEach((d) => {
+          const feature = featureDetails.find((f) => {
+            const nodeSourceSet = d.feature_type === 'lorsa' && lorsaSourceSet ? lorsaSourceSet : sourceSet;
+            return (
+              f &&
+              'index' in f &&
+              f.index === getIndexFromCantorValue(d.feature).toString() &&
+              'layer' in f &&
+              f.layer === `${d.layer}-${nodeSourceSet}`
+            );
+          });
+          if (feature) {
+            d.featureDetailNP = feature as NeuronWithPartialRelations;
+          }
+        });
+      };
+
+      if (shouldDeferNodePrefetch) {
+        void populateNeuronpediaNodeDetails()
+          .then(() => {
+            if (!abortSignal?.aborted) {
+              console.log(`[getGraph] deferred neuronpedia node prefetch complete for ${graphSlug}`);
+              setSelectedGraph((prev) =>
+                prev && prev.metadata?.slug === graphSlug ? { ...formattedData, nodes: [...formattedData.nodes] } : prev,
+              );
+            }
+          })
+          .catch((error) => {
+            if (!(error instanceof Error && error.name === 'AbortError')) {
+              console.error('Deferred node prefetch failed:', error);
+            }
+          });
+        setIsLoadingGraphData(false);
+        return formattedData;
       }
 
-      // put the details in the nodes (and in qk_only_nodes)
-      const featureDetails = batchesOfDetails.flat(1);
-      allNodes.forEach((d) => {
-        const feature = featureDetails.find((f) => {
-          const nodeSourceSet = d.feature_type === 'lorsa' && lorsaSourceSet ? lorsaSourceSet : sourceSet;
-          return (
-            f &&
-            'index' in f &&
-            f.index === getIndexFromCantorValue(d.feature).toString() &&
-            'layer' in f &&
-            f.layer === `${d.layer}-${nodeSourceSet}`
-          );
-        });
-        if (feature) {
-          d.featureDetailNP = feature as NeuronWithPartialRelations;
-        }
-      });
+      await populateNeuronpediaNodeDetails();
     }
     // these are the OLD gemma-2-2b graphs that don't have schema version 1
     // for these it's always transcoder-hp sourceset, using noncantor feature format
@@ -744,49 +964,70 @@ export function GraphProvider({
           maxActsToReturn: GRAPH_PREFETCH_ACTIVATIONS_COUNT,
         }));
       // split the features into batches of NEURONPEDIA_FEATURE_DETAIL_DOWNLOAD_BATCH_SIZE
-      const batches = [];
+      const batches: typeof features[] = [];
       for (let i = 0; i < features.length; i += NEURONPEDIA_FEATURE_DETAIL_DOWNLOAD_BATCH_SIZE) {
         batches.push(features.slice(i, i + NEURONPEDIA_FEATURE_DETAIL_DOWNLOAD_BATCH_SIZE));
       }
 
-      // call /api/features in batches, sequentially
-      const batchesOfDetails = [];
-      setLoadingGraphLabel(`Loading ${features.length} Nodes... `);
-      for (const batch of batches) {
-        const resp = await fetch('/api/features', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(batch),
-          signal: abortSignal,
-        });
-        if (abortSignal?.aborted) {
-          throw new Error(
-            'Request cancelled after /api/features batch fetch (MODEL_WITH_NP_DASHBOARDS_NOT_YET_CANTOR)',
-          );
+      const populateLegacyGemmaNodeDetails = async () => {
+        const batchesOfDetails: NeuronWithPartialRelations[][] = [];
+        setLoadingGraphLabel(`Loading ${features.length} Nodes... `);
+        for (const batch of batches) {
+          const resp = await fetch('/api/features', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(batch),
+            signal: abortSignal,
+          });
+          if (abortSignal?.aborted) {
+            throw new Error(
+              'Request cancelled after /api/features batch fetch (MODEL_WITH_NP_DASHBOARDS_NOT_YET_CANTOR)',
+            );
+          }
+          const da = (await resp.json()) as NeuronWithPartialRelations[];
+          batchesOfDetails.push(da);
         }
-        const da = (await resp.json()) as NeuronWithPartialRelations[];
-        batchesOfDetails.push(da);
+
+        const featureDetails = batchesOfDetails.flat(1);
+        formattedData.nodes
+          .filter((d) => nodeTypeHasFeatureDetail(d))
+          .forEach((d) => {
+            const feature = featureDetails.find(
+              (f) =>
+                f &&
+                'index' in f &&
+                f.index === getIndexFromFeatureAndGraph(selectedModelId, d, formattedData).toString() &&
+                'layer' in f &&
+                f.layer === `${getLayerFromOldSchema0Feature(selectedModelId, d)}-${sourceSet}`,
+            );
+            if (feature) {
+              d.featureDetailNP = feature as NeuronWithPartialRelations;
+            }
+          });
+      };
+
+      if (shouldDeferNodePrefetch) {
+        void populateLegacyGemmaNodeDetails()
+          .then(() => {
+            if (!abortSignal?.aborted) {
+              console.log(`[getGraph] deferred legacy gemma node prefetch complete for ${graphSlug}`);
+              setSelectedGraph((prev) =>
+                prev && prev.metadata?.slug === graphSlug ? { ...formattedData, nodes: [...formattedData.nodes] } : prev,
+              );
+            }
+          })
+          .catch((error) => {
+            if (!(error instanceof Error && error.name === 'AbortError')) {
+              console.error('Deferred legacy gemma node prefetch failed:', error);
+            }
+          });
+        setIsLoadingGraphData(false);
+        return formattedData;
       }
 
-      // put the details in the nodes
-      const featureDetails = batchesOfDetails.flat(1);
-      formattedData.nodes
-        .filter((d) => nodeTypeHasFeatureDetail(d)) // sometimes there are duplicate feature numbers from embed / logits / mlp recon error, we should always filter them out
-        .forEach((d) => {
-          const feature = featureDetails.find(
-            (f) =>
-              f &&
-              'index' in f &&
-              f.index === getIndexFromFeatureAndGraph(selectedModelId, d, formattedData).toString() &&
-              'layer' in f &&
-              f.layer === `${getLayerFromOldSchema0Feature(selectedModelId, d)}-${sourceSet}`,
-          );
-          if (feature) {
-            d.featureDetailNP = feature as NeuronWithPartialRelations;
-          }
-        });
+      await populateLegacyGemmaNodeDetails();
     } else if (selectedModelId === 'qwen3-4b') {
       // these are the mntss skip transcoders
       const featureDetails = await fetchInBatches(
@@ -913,6 +1154,9 @@ export function GraphProvider({
         .then((g) => {
           // Only update state if this request wasn't cancelled
           if (!abortController.signal.aborted) {
+            console.log(
+              `[GraphProvider] setSelectedGraph ${selectedMetadataGraph.slug}: nodes=${g.nodes?.length || 0}, links=${g.links?.length || 0}`,
+            );
             setSelectedGraph(g);
           } else {
             console.log(`Graph load for ${selectedMetadataGraph.slug} was aborted, not setting selected graph.`);
@@ -1040,6 +1284,14 @@ export function GraphProvider({
       setFullNPFeatureDetail,
       resetSelectedGraphToBlankVisState,
       loadSubgraph,
+      graphScores,
+      subgraphScores,
+      ablatedNodeIds,
+      toggleAblation,
+      ablationResult,
+      ablationError,
+      isAblating,
+      runAblation,
     }),
     [
       modelIdToMetadataMap,
@@ -1069,6 +1321,14 @@ export function GraphProvider({
       setFullNPFeatureDetail,
       resetSelectedGraphToBlankVisState,
       loadSubgraph,
+      graphScores,
+      subgraphScores,
+      ablatedNodeIds,
+      toggleAblation,
+      ablationResult,
+      ablationError,
+      isAblating,
+      runAblation,
     ],
   );
 

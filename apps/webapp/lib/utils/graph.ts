@@ -419,12 +419,21 @@ export const steerLogits = async (
     },
   );
 
-  let json = await response.json();
+  const steerResponseText = await response.text();
+  let json;
+  try {
+    json = JSON.parse(steerResponseText);
+  } catch {
+    throw new Error(`Steer API returned ${response.status}: ${steerResponseText}`);
+  }
   if (json.error) {
     throw new Error(json.error);
   }
+  if (json.detail) {
+    throw new Error(typeof json.detail === 'string' ? json.detail : JSON.stringify(json.detail));
+  }
   if (!response.ok) {
-    throw new Error(`External API returned ${response.status}: ${response.statusText}`);
+    throw new Error(`Steer API returned ${response.status}: ${JSON.stringify(json)}`);
   }
 
   if (isRunpodServerlessHost) {

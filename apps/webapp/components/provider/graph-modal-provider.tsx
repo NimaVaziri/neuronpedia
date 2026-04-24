@@ -29,6 +29,7 @@ type GraphModalContextType = {
   // Steer modal state
   isSteerModalOpen: boolean;
   setIsSteerModalOpen: (isOpen: boolean) => void;
+
 };
 
 // Create the modal context

@@ -53,6 +53,13 @@ export const getGraphServerRunpodHostForSourceSet = async (
 };
 
 export const getAuthHeaderForGraphServerRequest = (isRunpodServerlessHost: boolean) => {
+  // When using localhost graph, always use the local secret regardless of runpod status
+  if (USE_LOCALHOST_GRAPH) {
+    return {
+      Authorization: '',
+      'x-secret-key': GRAPH_SERVER_SECRET,
+    };
+  }
   if (isRunpodServerlessHost) {
     return {
       Authorization: `Bearer ${GRAPH_RUNPOD_SECRET}`,
@@ -91,6 +98,7 @@ export const getGraphServerRequestUrlForSourceSet = async (
 };
 
 export const getIsRunpodServerlessHostForSourceSet = async (modelId: string, sourceSetName: string) => {
+  if (USE_LOCALHOST_GRAPH) return false;
   const hosts = await getSourceSetGraphHosts(modelId, sourceSetName);
-  return hosts.every((h) => h.graphHostSource.runpodServerlessUrl);
+  return hosts.length > 0 && hosts.every((h) => h.graphHostSource.runpodServerlessUrl);
 };

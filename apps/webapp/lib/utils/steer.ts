@@ -37,7 +37,7 @@ export const STEER_SEED = 16;
 export const STEER_METHOD = NPSteerMethod.SimpleAdditive;
 export const STEER_METHOD_ASSISTANT_CAP = NPSteerMethod.ProjectionCap;
 export const STEER_TOPK_LOGITS = 5;
-export const STEER_TOPK_LOGITS_MAX = 10;
+export const STEER_TOPK_LOGITS_MAX = 100;
 export const STEER_FREEZE_ATTENTION = true;
 export const STEER_N_LOGPROBS = 5;
 

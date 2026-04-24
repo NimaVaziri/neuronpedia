@@ -108,8 +108,25 @@ export function getLayerFromCantorValue(feature: number): number {
   return x;
 }
 
+function getGraphModelId(modelId: string, selectedGraph: CLTGraph | null) {
+  return modelId || selectedGraph?.metadata.scan || selectedGraph?.metadata.neuronpedia_internal_model?.id || '';
+}
+
+function getNodeLayer(node: CLTGraphNode) {
+  const layer = parseInt(node.layer, 10);
+  return Number.isFinite(layer) ? layer : null;
+}
+
 export function getLayerFromFeatureAndGraph(modelId: string, node: CLTGraphNode, selectedGraph: CLTGraph | null) {
-  if (selectedGraph?.metadata.schema_version === 1 || modelId === 'gemma-3-27b-it') {
+  const resolvedModelId = getGraphModelId(modelId, selectedGraph);
+  const nodeLayer = getNodeLayer(node);
+  if (nodeLayer !== null) {
+    return nodeLayer;
+  }
+  if (
+    (selectedGraph?.metadata.schema_version === 1 || resolvedModelId === 'gemma-3-27b-it') &&
+    Number.isFinite(node.feature)
+  ) {
     return getLayerFromCantorValue(node.feature);
   }
   // cases
@@ -117,17 +134,21 @@ export function getLayerFromFeatureAndGraph(modelId: string, node: CLTGraphNode,
   // - gemma-2-2b old schema = handled here
   // - qwen3-4b = new schema = handled above
   // - qwen3-4b old schema = we aren't steering those
-  if (modelId === 'gemma-2-2b') {
+  if (resolvedModelId === 'gemma-2-2b' && Number.isFinite(node.feature)) {
     return getLayerFromOldSchema0Feature(modelId, node);
   }
   console.error(
-    `LayerFromFeature: ${modelId} - failed to get layer from feature. Returning 0. Graph: ${selectedGraph?.metadata.scan}`,
+    `LayerFromFeature: ${resolvedModelId} - failed to get layer from feature. Returning 0. Graph: ${selectedGraph?.metadata.scan}`,
   );
   return 0;
 }
 
 export function getIndexFromFeatureAndGraph(modelId: string, node: CLTGraphNode, selectedGraph: CLTGraph | null) {
-  if (selectedGraph?.metadata.schema_version === 1 || modelId === 'gemma-3-27b-it') {
+  const resolvedModelId = getGraphModelId(modelId, selectedGraph);
+  if (
+    (selectedGraph?.metadata.schema_version === 1 || resolvedModelId === 'gemma-3-27b-it') &&
+    Number.isFinite(node.feature)
+  ) {
     return getIndexFromCantorValue(node.feature);
   }
   // cases
@@ -135,11 +156,11 @@ export function getIndexFromFeatureAndGraph(modelId: string, node: CLTGraphNode,
   // - gemma-2-2b old schema = handled here
   // - qwen3-4b = new schema = handled above
   // - qwen3-4b old schema = we aren't steering those
-  if (modelId === 'gemma-2-2b') {
+  if (resolvedModelId === 'gemma-2-2b' && Number.isFinite(node.feature)) {
     return getIndexFromOldSchema0Feature(modelId, node);
   }
   console.error(
-    `IndexFromFeature: ${modelId} - failed to get index from feature. Returning 0. Graph: ${selectedGraph?.metadata.scan}`,
+    `IndexFromFeature: ${resolvedModelId} - failed to get index from feature. Returning 0. Graph: ${selectedGraph?.metadata.scan}`,
   );
   return 0;
 }
@@ -582,6 +603,11 @@ export function shouldShowNodeForInfluenceThreshold(
     return true;
   }
 
+  // always show error nodes when showErrorNodes is enabled (they bypass pruning)
+  if (node.feature_type === 'mlp reconstruction error' && visState.showErrorNodes) {
+    return true;
+  }
+
   // always show pinned nodes
   if (node.nodeId !== undefined && visState.pinnedIds.includes(node.nodeId)) {
     return true;
@@ -677,10 +703,6 @@ export function clientCheckIsEmbed() {
   return typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('embed') === 'true';
 }
 
-// various optimizations for Claude to get less confused. currently: hides MLP reconstruction errors
-export function clientCheckClaudeMode() {
-  return typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('claudeMode') === 'true';
-}
 
 export function parseGraphSupernodes(supernodes?: string): GraphSupernodes {
   if (!supernodes) return [];
